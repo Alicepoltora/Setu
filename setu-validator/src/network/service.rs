@@ -15,7 +15,6 @@
 //!
 //! This module implements several optimizations for high throughput:
 //! - DashMap for lock-free concurrent access to transfer_status, events, solver_info
-//! - Reverse index (solver_pending_transfers) to avoid O(n) scans
 //! - Lock-free VLC allocation via atomic counter
 
 use super::registration::ValidatorRegistrationHandler;
@@ -102,9 +101,6 @@ pub struct ValidatorNetworkService {
 
     /// Transfer tracking - uses DashMap for lock-free concurrent access
     transfer_status: Arc<DashMap<String, TransferTracker>>,
-
-    /// Reverse index: solver_id -> pending transfer_ids (for O(1) lookup)
-    solver_pending_transfers: Arc<DashMap<String, Vec<String>>>,
 
     /// Event storage - uses DashMap for lock-free concurrent access
     events: Arc<DashMap<String, Event>>,
@@ -216,7 +212,6 @@ impl ValidatorNetworkService {
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             transfer_status,
-            solver_pending_transfers: Arc::new(DashMap::new()),
             events,
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events,
@@ -304,7 +299,6 @@ impl ValidatorNetworkService {
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             transfer_status,
-            solver_pending_transfers: Arc::new(DashMap::new()),
             events,
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events,
@@ -620,7 +614,6 @@ impl ValidatorNetworkService {
             &self.task_preparer,
             &self.coin_reservation_manager,
             &self.transfer_status,
-            &self.solver_pending_transfers,
             &self.transfer_counter,
             vlc_time,
             request,
@@ -658,7 +651,6 @@ impl ValidatorNetworkService {
             &self.batch_task_preparer,
             &self.coin_reservation_manager,
             &self.transfer_status,
-            &self.solver_pending_transfers,
             &self.transfer_counter,
             &self.vlc_counter,
             request,
