@@ -616,10 +616,12 @@ impl ConsensusValidator {
         // In single-node mode, add_event() → try_create_cf() → check_finalization()
         // may finalize a CF immediately. The internal message channel is not consumed
         // in production, so we must persist here synchronously.
-        let mut any_persisted = false;
         for anchor in self.engine.take_pending_anchors().await {
             match self.persist_finalized_anchor(&anchor).await {
-                Ok(()) => { any_persisted = true; }
+                Ok(()) => {
+                    // P2 fix: mark this anchor as persisted so its CF can broadcast
+                    self.engine.mark_anchor_persisted(&anchor.id).await;
+                }
                 Err(e) => {
                     warn!(
                         anchor_id = %anchor.id,
@@ -630,13 +632,10 @@ impl ConsensusValidator {
             }
         }
         // Layer A: only run post-persist completion (broadcast + advance round)
-        // after at least one anchor durably persisted. If all persists failed,
-        // the queued completions stay in the engine and will be retried by the
-        // next caller invocation.
-        if any_persisted {
-            if let Err(e) = self.engine.complete_pending_finalizations().await {
-                warn!(error = %e, "complete_pending_finalizations failed after submit_event persist");
-            }
+        // after at least one anchor durably persisted. Unpersisted anchors remain
+        // queued until the next persist attempt (idempotent under restart).
+        if let Err(e) = self.engine.complete_pending_finalizations().await {
+            warn!(error = %e, "complete_pending_finalizations failed after submit_event persist");
         }
         
         Ok(event_id)
@@ -684,7 +683,8 @@ impl ConsensusValidator {
                 );
                 match self.persist_finalized_anchor(a).await {
                     Ok(()) => {
-                        // Layer A: trigger post-persist broadcast + round advance.
+                        // P2 fix: mark anchor as persisted so its CF broadcasts
+                        self.engine.mark_anchor_persisted(&a.id).await;
                         if let Err(e) = self.engine.complete_pending_finalizations().await {
                             warn!(error = %e, "complete_pending_finalizations failed after receive_cf persist");
                         }
@@ -727,6 +727,8 @@ impl ConsensusValidator {
                 );
                 match self.persist_finalized_anchor(a).await {
                     Ok(()) => {
+                        // P2 fix: mark anchor as persisted so its CF broadcasts
+                        self.engine.mark_anchor_persisted(&a.id).await;
                         if let Err(e) = self.engine.complete_pending_finalizations().await {
                             warn!(error = %e, "complete_pending_finalizations failed after receive_vote persist");
                         }
@@ -881,8 +883,8 @@ impl ConsensusValidator {
         self.engine.get_subnet_state_root(subnet_id).await
     }
     
-    /// Mark an anchor as persisted (for safe GC)
-    pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
+    /// Mark an anchor as persisted (for safe GC and completion queue purposes)
+    pub async fn mark_anchor_persisted(&self, anchor_id: &setu_types::AnchorId) {
         self.engine.mark_anchor_persisted(anchor_id).await;
     }
     
@@ -919,14 +921,14 @@ impl ConsensusValidator {
 
         if result.is_some() {
             // Persist any inline-finalized anchors (same as submit_event)
-            let mut any_persisted = false;
             for anchor in self.engine.take_pending_anchors().await {
                 if self.persist_finalized_anchor(&anchor).await.is_ok() {
-                    any_persisted = true;
+                    // P2 fix: mark this anchor as persisted so its CF can broadcast
+                    self.engine.mark_anchor_persisted(&anchor.id).await;
                 }
             }
-            if any_persisted {
-                let _ = self.engine.complete_pending_finalizations().await;
+            if let Err(e) = self.engine.complete_pending_finalizations().await {
+                warn!(error = %e, "complete_pending_finalizations failed after receive_cf persist");
             }
         }
 
@@ -1355,7 +1357,7 @@ mod tests {
 
     /// F8: Layer A — `handle_finalization` enqueues the CF in
     /// `pending_completions` but does NOT advance round or broadcast until
-    /// `complete_pending_finalizations()` is called.
+    /// the anchor is marked persisted and `complete_pending_finalizations()` is called.
     #[tokio::test]
     async fn test_f8_finalization_defers_broadcast_until_complete() {
         let mut config = create_test_config();
@@ -1375,6 +1377,12 @@ mod tests {
         // Layer A: round must NOT advance pre-completion.
         assert_eq!(engine.current_round().await, 0);
 
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 0);
+
+        engine
+            .mark_anchor_persisted(&anchor.as_ref().unwrap().id)
+            .await;
         engine.complete_pending_finalizations().await.unwrap();
         // After completion: round advances exactly once.
         assert_eq!(engine.current_round().await, 1);

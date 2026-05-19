@@ -3334,6 +3334,7 @@ mod tests {
         /// overlapping df_mutated and df_deleted maps. (Real call sites
         /// always go through `record_df_delete`, so this is a fail-safe.)
         #[test]
+        #[cfg(debug_assertions)]
         #[should_panic(expected = "df_mutated ∩ df_deleted must be empty")]
         fn test_df_mutated_and_deleted_overlap_panics_in_debug() {
             let parent = ObjectId::new([0x14; 32]);

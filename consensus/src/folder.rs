@@ -593,6 +593,11 @@ impl ConsensusManager {
         self.finalized_cfs.len()
     }
 
+    #[cfg(test)]
+    pub fn has_persisted_anchor_for_testing(&self, anchor_id: &str) -> bool {
+        self.persisted_anchor_ids.contains(anchor_id)
+    }
+
     pub fn last_finalized_cf(&self) -> Option<&ConsensusFrame> {
         self.finalized_cfs.last()
     }

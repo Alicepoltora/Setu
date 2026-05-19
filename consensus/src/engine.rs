@@ -35,6 +35,26 @@ use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
 use crate::vlc::VLC;
 
+/// Completion queue entry: tracks CF with per-anchor persistence status.
+///
+/// Layer A (fix-post-restart-finality-stall-v2) defers CF broadcast and round
+/// advancement until after anchor persistence succeeds. This struct ensures
+/// only successfully-persisted anchors trigger broadcast.
+///
+/// See `docs/feat/fix-submit-event-batch-hole/design.md` for batch invariant
+/// protection.
+#[derive(Debug, Clone)]
+struct CompletionEntry {
+    /// The finalized ConsensusFrame waiting for broadcast
+    cf: ConsensusFrame,
+    /// AnchorId that produced this CF (tracks which anchor must persist first)
+    anchor_id: setu_types::AnchorId,
+    /// Expected round at finalize time (idempotency guard)
+    expected_round: Round,
+    /// Whether this anchor has been durably persisted
+    persisted: bool,
+}
+
 /// Messages exchanged between consensus components
 #[derive(Debug, Clone)]
 pub enum ConsensusMessage {
@@ -96,11 +116,16 @@ pub struct ConsensusEngine {
     /// round-drift window (see fix-post-restart-finality-stall-v2 design.md
     /// Layer A and review-log.md R3-VERIFY-4/8).
     ///
-    /// Each entry is `(ConsensusFrame, expected_round)` where `expected_round`
-    /// is the validator-set round captured at finalize time. The completion
-    /// step only advances the round if it still matches `expected_round`,
-    /// making the call idempotent under restart / duplicate dispatch.
-    pending_completions: Arc<Mutex<Vec<(ConsensusFrame, Round)>>>,
+    /// Each entry tracks a CF with its associated anchor_id, expected round, and
+    /// persistence status. The completion step only advances the round if it
+    /// still matches the entry's expected round, making the call idempotent
+    /// under restart / duplicate dispatch.
+    /// Only CFs for anchors that have been marked as persisted (via
+    /// `mark_anchor_persisted()`) are processed by `complete_pending_finalizations()`.
+    /// This protects against the batch-hole invariant violation where one anchor
+    /// fails to persist but its CF is still broadcast.
+    /// See `docs/feat/fix-submit-event-batch-hole/design.md` for details.
+    pending_completions: Arc<Mutex<Vec<CompletionEntry>>>,
     /// Broadcast channel for CF finalization notifications.
     /// Injected by caller (ConsensusValidator) via set_finalization_tx().
     /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
@@ -342,12 +367,23 @@ impl ConsensusEngine {
     ///   peer-driven `receive_finalized_cf` for the same CF on a later tick),
     ///   we do not double-advance.
     pub async fn complete_pending_finalizations(&self) -> SetuResult<()> {
-        let pending: Vec<(ConsensusFrame, Round)> = {
+        // Collect persisted entries and remove them from queue
+        let pending: Vec<CompletionEntry> = {
             let mut q = self.pending_completions.lock().await;
-            std::mem::take(&mut *q)
+            let mut result = Vec::new();
+            q.retain(|e| {
+                if e.persisted {
+                    result.push(e.clone());
+                    false // remove from queue
+                } else {
+                    true // keep in queue
+                }
+            });
+            result
         };
-
-        for (cf, expected_round) in pending {
+        for entry in pending {
+            let cf = entry.cf;
+            let expected_round = entry.expected_round;
             let cf_id = cf.id.clone();
 
             // Internal channel (legacy local listeners).
@@ -405,6 +441,27 @@ impl ConsensusEngine {
     #[cfg(test)]
     pub async fn pending_completions_len(&self) -> usize {
         self.pending_completions.lock().await.len()
+    }
+
+    /// Mark an anchor as durably persisted for completion queue purposes.
+    ///
+    /// When an anchor persists successfully, call this to unblock its associated
+    /// CF from being broadcasted by `complete_pending_finalizations()`.
+    ///
+    /// This ensures Layer A invariant: no CF broadcast without prior anchor persist.
+    /// See `docs/feat/fix-submit-event-batch-hole/design.md` for details.
+    pub async fn mark_anchor_persisted(&self, anchor_id: &setu_types::AnchorId) {
+        {
+            let mut q = self.pending_completions.lock().await;
+            for entry in q.iter_mut() {
+                if entry.anchor_id == *anchor_id {
+                    entry.persisted = true;
+                }
+            }
+        }
+
+        let mut manager = self.consensus_manager.write().await;
+        manager.mark_anchor_persisted(anchor_id);
     }
 
     /// Mark finalized anchor events as no longer pending in the active DAG.
@@ -1311,7 +1368,7 @@ impl ConsensusEngine {
     /// 1. `dag_manager.update_min_depth(...)`
     /// 2. `mark_anchor_events_finalized_in_active_dag(...)`
     /// 3. push to `pending_persist_cfs` (durable index queue)
-    /// 4. push `(cf, expected_round)` to `pending_completions` (post-persist queue)
+    /// 4. push `CompletionEntry` to `pending_completions` (post-persist queue)
     ///
     /// Note: This method extracts data from manager before acquiring other locks
     /// to avoid potential deadlock from holding multiple write locks.
@@ -1347,7 +1404,12 @@ impl ConsensusEngine {
             };
             {
                 let mut q = self.pending_completions.lock().await;
-                q.push((cf.clone(), expected_round));
+                q.push(CompletionEntry {
+                    cf: cf.clone(),
+                    anchor_id: anchor.id.clone(),
+                    expected_round,
+                    persisted: false,
+                });
             }
 
             debug!(
@@ -1466,10 +1528,6 @@ impl ConsensusEngine {
     ///
     /// Call this after successfully storing the anchor to AnchorStore.
     /// This enables safe garbage collection of finalized CFs from memory.
-    pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
-        let mut manager = self.consensus_manager.write().await;
-        manager.mark_anchor_persisted(anchor_id);
-    }
 
     /// Heartbeat attempt to create a CF for low-frequency events.
     ///
@@ -1739,6 +1797,7 @@ pub struct DagStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcaster::MockBroadcaster;
     use setu_types::{Anchor, AnchorMerkleRoots, EventType, NodeInfo, ValidatorInfo};
     use setu_vlc::VectorClock;
     use std::collections::HashMap;
@@ -1813,6 +1872,9 @@ mod tests {
         assert!(anchor.is_some());
         // Layer A: round advance is deferred until complete_pending_finalizations.
         assert_eq!(engine.current_round().await, 0);
+        engine
+            .mark_anchor_persisted(&anchor.as_ref().unwrap().id)
+            .await;
         engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
 
@@ -1853,8 +1915,124 @@ mod tests {
         assert!(anchor.is_some());
         // Layer A: deferred until completion drains.
         assert_eq!(engine.current_round().await, 0);
+        engine
+            .mark_anchor_persisted(&anchor.as_ref().unwrap().id)
+            .await;
         engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_completion_does_not_broadcast_before_anchor_marked_persisted() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+        let broadcaster = Arc::new(MockBroadcaster::new("v2".to_string(), 2));
+        engine.set_broadcaster(broadcaster.clone()).await;
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        let cf_id = cf.id.clone();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+        let anchor = anchor.expect("finalized CF should return anchor");
+        assert!(finalized);
+
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 0);
+        assert_eq!(engine.pending_completions_len().await, 1);
+        assert!(broadcaster.get_finalized_broadcasts().is_empty());
+
+        engine.mark_anchor_persisted(&anchor.id).await;
+        {
+            let manager = engine.consensus_manager.read().await;
+            assert!(manager.has_persisted_anchor_for_testing(&anchor.id));
+        }
+
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
+        assert_eq!(engine.pending_completions_len().await, 0);
+        assert_eq!(broadcaster.get_finalized_broadcasts(), vec![cf_id]);
+    }
+
+    #[tokio::test]
+    async fn test_partial_persisted_batch_only_completes_marked_anchor() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let broadcaster = Arc::new(MockBroadcaster::new("v1".to_string(), 2));
+        engine.set_broadcaster(broadcaster.clone()).await;
+
+        let anchor1 = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root-1".to_string(),
+            None,
+            0,
+        );
+        let anchor2 = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root-2".to_string(),
+            Some(anchor1.id.clone()),
+            1,
+        );
+        let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
+        let cf2 = ConsensusFrame::new(anchor2.clone(), "v1".to_string());
+        {
+            let mut q = engine.pending_completions.lock().await;
+            q.push(CompletionEntry {
+                cf: cf1.clone(),
+                anchor_id: anchor1.id.clone(),
+                expected_round: 0,
+                persisted: false,
+            });
+            q.push(CompletionEntry {
+                cf: cf2.clone(),
+                anchor_id: anchor2.id.clone(),
+                expected_round: 0,
+                persisted: false,
+            });
+        }
+
+        engine.mark_anchor_persisted(&anchor1.id).await;
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(broadcaster.get_finalized_broadcasts(), vec![cf1.id.clone()]);
+        assert_eq!(engine.pending_completions_len().await, 1);
+        assert_eq!(engine.current_round().await, 1);
+
+        engine.mark_anchor_persisted(&anchor2.id).await;
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(
+            broadcaster.get_finalized_broadcasts(),
+            vec![cf1.id.clone(), cf2.id.clone()]
+        );
+        assert_eq!(engine.pending_completions_len().await, 0);
+        assert_eq!(
+            engine.current_round().await,
+            1,
+            "synthetic entries share expected_round=0, so the second completion is idempotent"
+        );
     }
 
     #[tokio::test]
