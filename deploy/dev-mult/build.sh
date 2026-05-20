@@ -58,6 +58,44 @@ copy_remote_artifact_atomically() {
     return 1
 }
 
+# Single-rsync distribution: pushes all requested artifacts from BUILD_SERVER
+# to target host in ONE ssh connection instead of N. rsync writes each file to
+# a hidden tmp then renames (atomic per file), so we still get the same
+# crash-safety as copy_remote_artifact_atomically without N handshakes.
+# Returns 0 on success, non-zero if rsync missing or transfer failed; caller
+# should fall back to copy_remote_artifact_atomically.
+distribute_bundle_via_rsync() {
+    local host="$1"
+    shift
+    local artifacts=("$@")
+    local rsync_check
+    rsync_check="$(remote_exec "$BUILD_SERVER" "command -v rsync >/dev/null 2>&1 && echo ok || echo missing" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$rsync_check" != "ok" ]; then
+        return 2
+    fi
+
+    local file_args=""
+    local f
+    for f in "${artifacts[@]}"; do
+        file_args="${file_args} '${REMOTE_BIN}/${f}'"
+    done
+
+    local attempt
+    for attempt in 1 2 3; do
+        if remote_exec "$BUILD_SERVER" "
+            SSHPASS='${SSH_PWD}' rsync -az --partial \\
+                -e 'sshpass -e ssh ${INNER_SSH_OPTS}' \\
+                ${file_args} \\
+                '${SSH_USER}@${host}:${REMOTE_BIN}/'
+        "; then
+            return 0
+        fi
+        print_warn "${host}: rsync 分发失败，重试 ${attempt}/3"
+        sleep 5
+    done
+    return 1
+}
+
 print_header "Setu 构建 & 分发"
 echo "  源码指纹: ${LOCAL_SOURCE_FINGERPRINT}"
 echo "  Git commit: ${LOCAL_GIT_COMMIT}"
@@ -187,22 +225,35 @@ if [ "$SKIP_DIST" = false ]; then
         fi
         local_host="${SERVERS[$i]}"
         echo "    → ${VALIDATOR_IDS[$i]} (${local_host})"
-        
+
         # 确保远程目录存在
         remote_exec "$local_host" "mkdir -p ${REMOTE_BIN}"
-        
-        # 通过构建服务器中转复制二进制
-        # 关键二进制: 失败则报错
-        for bin_name in setu-validator setu-solver; do
-            copy_remote_artifact_atomically "$local_host" "$bin_name" 1
-        done
-        # 可选二进制: 失败时静默跳过
-        for bin_name in setu-cli setu-benchmark; do
-            copy_remote_artifact_atomically "$local_host" "$bin_name" 1 2>/dev/null || true
+
+        # 收集本次实际存在的 artifact (可选二进制可能缺失)
+        bundle=(setu-validator setu-solver setu-build-info.env)
+        for opt in setu-cli setu-benchmark; do
+            if remote_exec "$BUILD_SERVER" "[ -f '${REMOTE_BIN}/${opt}' ]" 2>/dev/null; then
+                bundle+=("$opt")
+            fi
         done
 
-        copy_remote_artifact_atomically "$local_host" "setu-build-info.env" 0
-        remote_exec "$local_host" "chmod +x ${REMOTE_BIN}/* 2>/dev/null || true"
+        # 首选: 单次 rsync 分发所有 artifact (1 个 SSH 连接 vs N 个)
+        if distribute_bundle_via_rsync "$local_host" "${bundle[@]}"; then
+            print_ok "${local_host}: rsync 分发 ${#bundle[@]} 个 artifact 成功"
+        else
+            print_warn "${local_host}: rsync 不可用或失败，退回逐文件 scp"
+            # 关键二进制: 失败则报错
+            for bin_name in setu-validator setu-solver; do
+                copy_remote_artifact_atomically "$local_host" "$bin_name" 1
+            done
+            # 可选二进制: 失败时静默跳过
+            for bin_name in setu-cli setu-benchmark; do
+                copy_remote_artifact_atomically "$local_host" "$bin_name" 1 2>/dev/null || true
+            done
+            copy_remote_artifact_atomically "$local_host" "setu-build-info.env" 0
+        fi
+
+        remote_exec "$local_host" "chmod +x ${REMOTE_BIN}/setu-validator ${REMOTE_BIN}/setu-solver 2>/dev/null; chmod +x ${REMOTE_BIN}/setu-cli ${REMOTE_BIN}/setu-benchmark 2>/dev/null; true"
     done
     print_ok "二进制分发完成"
 else

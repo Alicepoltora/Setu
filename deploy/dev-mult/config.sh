@@ -47,7 +47,25 @@ SSH_USER=$(_read_env 'VALIDATOR-NODE-USERNAME')
 SSH_PWD=$(_read_env 'VALIDATOR-NODE-PWD')
 SSH_USER="${SSH_USER:-root}"
 _fail_if_env_placeholder 'VALIDATOR-NODE-PWD' "$SSH_PWD"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o LogLevel=ERROR"
+
+# ControlMaster multiplexing: one TCP+auth handshake per (user,host,port) reused
+# for N subsequent ssh/scp/rsync. Mitigates sshd MaxStartups / fail2ban
+# rate-limiting observed during deploy bursts (bug 20260421-deploy-ssh-flakiness).
+# %C = hash(user+host+port), short and collision-free across our 3 nodes.
+SSH_CTRL_DIR="${SSH_CTRL_DIR:-/tmp}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=${SSH_CTRL_DIR}/setu-ssh-%C -o ControlPersist=300"
+
+# Options passed inline to ssh/scp/rsync running ON a remote host (inter-VM hop in
+# remote_to_remote_copy). Mirrors SSH_OPTS but uses a distinct control path so
+# the remote side does not collide with local sockets and so we can clean them
+# independently. /tmp on Contabo Ubuntu is world-writable and persistent enough.
+INNER_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR -o ControlMaster=auto -o ControlPath=/tmp/setu-bs-%C -o ControlPersist=300"
+
+# Best-effort cleanup of local ControlMaster sockets on shell exit.
+_cleanup_ssh_control_sockets() {
+    rm -f "${SSH_CTRL_DIR}"/setu-ssh-* 2>/dev/null || true
+}
+trap _cleanup_ssh_control_sockets EXIT
 
 # 构建服务器 (默认使用第一台)
 BUILD_SERVER="${SERVERS[0]}"
@@ -142,13 +160,15 @@ remote_sync() {
 
 # 服务器间复制文件: 在 from_host 上执行 scp 直接推送到 to_host
 # (避免 scp -3 双重认证问题，使用 SSHPASS 环境变量避免密码引号问题)
+# 使用 INNER_SSH_OPTS 启用 BUILD_SERVER 端的 ControlMaster，缓解 inter-VM hop
+# 的 sshd MaxStartups/fail2ban 速率限制。
 remote_to_remote_copy() {
     local from_host="$1"
     local from_path="$2"
     local to_host="$3"
     local to_path="$4"
     remote_exec "$from_host" \
-        "SSHPASS='${SSH_PWD}' sshpass -e scp -o StrictHostKeyChecking=no -o LogLevel=ERROR '${from_path}' '${SSH_USER}@${to_host}:${to_path}'"
+        "SSHPASS='${SSH_PWD}' sshpass -e scp ${INNER_SSH_OPTS} '${from_path}' '${SSH_USER}@${to_host}:${to_path}'"
 }
 
 # 等待服务健康
