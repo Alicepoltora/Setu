@@ -605,6 +605,11 @@ impl GlobalStateManager {
     /// 4. Verify reconstructed root matches persisted root (consistency check)
     /// 5. Restore last anchor info from MerkleMeta
     ///
+    /// **CODEC ASSUMPTIONS** (G6): Recovery decodes all values with BCS (from SetuDB).
+    /// If RocksDB was written with a different codec (e.g., by a diagnostic tool or
+    /// corrupt migration), decode will fail or produce wrong data. This is correct
+    /// behavior — recovery should fail loudly on codec mismatches, not silently corrupt.
+    ///
     /// ## Returns
     ///
     /// Returns a `RecoverySummary` with statistics about the recovery.

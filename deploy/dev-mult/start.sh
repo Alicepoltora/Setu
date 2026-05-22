@@ -35,7 +35,11 @@ start_validator() {
     local host="${SERVERS[$idx]}"
     local vid="${VALIDATOR_IDS[$idx]}"
     local peers
+    local callback_addr
+    local governance_timeout_secs
     peers=$(get_peer_validators "$idx")
+    callback_addr="${VALIDATOR_CALLBACK_ADDR:-${host}:${HTTP_PORT}}"
+    governance_timeout_secs="${GOVERNANCE_TIMEOUT_SECS:-300}"
 
     echo "  启动 ${vid} (${host})..."
 
@@ -64,6 +68,8 @@ start_validator() {
             GENESIS_FILE=${REMOTE_CONFIG}/genesis-remote.json \
             VALIDATOR_KEY_FILE=${REMOTE_KEYS}/${vid}.key \
             VALIDATOR_DB_PATH=${REMOTE_DATA}/db \
+            VALIDATOR_CALLBACK_ADDR=${callback_addr} \
+            GOVERNANCE_TIMEOUT_SECS=${governance_timeout_secs} \
             SETU_RAW_TRANSFER_API_TOKEN='${SETU_RAW_TRANSFER_API_TOKEN:-}' \
             RUST_LOG='${RUST_LOG}' \
             ${REMOTE_BIN}/setu-validator \
@@ -82,7 +88,7 @@ start_validator() {
     }
     
     if echo "$output" | grep -q 'STARTED'; then
-        print_ok "${vid} 已启动 (HTTP=${host}:${HTTP_PORT}, P2P=${host}:${P2P_PORT})"
+        print_ok "${vid} 已启动 (HTTP=${host}:${HTTP_PORT}, P2P=${host}:${P2P_PORT}, callback=${callback_addr})"
     else
         print_err "${vid} 启动失败! 查看日志: ./logs.sh $((idx+1))"
     fi

@@ -41,18 +41,42 @@ impl SetuDB {
             .ok_or_else(|| StorageError::cf_not_found(cf.name()))
     }
 
-    /// Serialize a key using bincode
+    /// Serialize a key using bincode 2.0-rc.3.
+    ///
+    /// **CODEC CONTRACT** (G6): Keys MUST always use bincode. This is non-negotiable
+    /// across all SetuDB operations. Values use BCS (see `encode_value`).
+    /// Mixing codecs (e.g., decoding bincode-encoded key as BCS) produces silent
+    /// data corruption or decode panics in recovery/diagnostic paths.
+    ///
+    /// **Recovery note**: Any manual RocksDB read or migration tool that reads
+    /// bytes from disk MUST verify the codec assumption before decoding.
+    /// See `docs/testnet/deferred-bugs-priority-assessment-20260519.md#p1-high`.
     fn encode_key<K: Encode>(key: &K) -> Result<Vec<u8>> {
         bincode::encode_to_vec(key, bincode::config::standard())
             .map_err(|e| StorageError::serialization(e.to_string()))
     }
 
-    /// Serialize a value using BCS (Binary Canonical Serialization)
+    /// Serialize a value using BCS (Binary Canonical Serialization).
+    ///
+    /// **CODEC CONTRACT** (G6): Values MUST always use BCS. Keys use bincode
+    /// (see `encode_key`). This split is required for Merkle consistency and
+    /// canonical serialization. Any code that needs to read raw bytes from
+    /// RocksDB and decode them with a different codec (e.g., migration tools,
+    /// recovery utilities, diagnostic scripts) MUST verify codec assumptions
+    /// and fail loudly if they don't match.
     fn encode_value<V: Serialize>(value: &V) -> Result<Vec<u8>> {
         bcs::to_bytes(value).map_err(|e| StorageError::serialization(e.to_string()))
     }
 
-    /// Deserialize a value using BCS
+    /// Deserialize a value using BCS.
+    ///
+    /// **CODEC CONTRACT** (G6): Values MUST always decode with BCS. If you are
+    /// adding a new field to a BCS-serialized struct (e.g., Event, ExecutionResult,
+    /// StateChange), BCS has no `#[serde(default)]` escape hatch — existing bytes
+    /// will fail to decode. Plan schema changes carefully.
+    ///
+    /// If decode fails, the error is NOT silent; it propagates up. This is correct
+    /// behavior and MUST NOT be silently swallowed in recovery/replay paths.
     fn decode_value<V: DeserializeOwned>(bytes: &[u8]) -> Result<V> {
         bcs::from_bytes(bytes).map_err(|e| StorageError::deserialization(e.to_string()))
     }
@@ -149,7 +173,12 @@ impl SetuDB {
         Ok(())
     }
 
-    /// Get a value by raw byte key
+    /// Get a value by raw byte key.
+    ///
+    /// **CODEC CONTRACT**: Values are decoded with BCS. If you are reading from
+    /// a CF that was written via a different code path or a prior version that
+    /// used a different codec, this will fail or produce wrong data. Always verify
+    /// assumptions about which codec produced the bytes before calling this.
     pub fn get_raw<V>(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<V>>
     where
         V: DeserializeOwned,

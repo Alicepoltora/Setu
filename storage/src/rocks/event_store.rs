@@ -6,7 +6,7 @@
 //! ## Key Design Decisions
 //!
 //! 1. **Composite Keys for Depth**: Uses `depth:{event_id}` prefix keys for depth storage
-//! 2. **Depth Reverse Index**: Uses `depthidx:{depth:08x}:{event_id}` for efficient range queries
+//! 2. **Depth Reverse Index**: Uses `depthidx:{depth:016x}:{event_id}` for efficient range queries
 //! 3. **Atomic Batch Writes**: Uses WriteBatch for atomic store_with_depth operations
 //! 4. **API Compatible**: Maintains the same async API as in-memory EventStore
 //! 5. **Index Tables**: Stores by_creator and by_status as separate key prefixes
@@ -16,7 +16,7 @@
 //! All data is stored in ColumnFamily::Events:
 //! - `evt:{event_id}` -> Event (main event data)
 //! - `depth:{event_id}` -> u64 (depth information)
-//! - `depthidx:{depth:08x}:{event_id}` -> () (depth reverse index for range queries)
+//! - `depthidx:{depth:016x}:{event_id}` -> () (depth reverse index for range queries)
 //! - `creator:{creator}:{event_id}` -> () (creator index)
 //! - `status:{status}:{event_id}` -> () (status index)
 
@@ -35,6 +35,8 @@ mod key_prefix {
     pub const CREATOR: &[u8] = b"creator:";
     pub const STATUS: &[u8] = b"status:";
 }
+
+const DEPTH_IDX_HEX_WIDTH: usize = 16;
 
 /// RocksDB-backed EventStore implementation
 pub struct RocksDBEventStore {
@@ -75,17 +77,26 @@ impl RocksDBEventStore {
         key
     }
 
-    /// Depth index key: `depthidx:{depth:08x}:{event_id}` → ()
+    /// Depth index key: `depthidx:{depth:016x}:{event_id}` → ()
     /// Enables efficient range scans by depth without full-table scan.
     fn depth_idx_key(depth: u64, event_id: &EventId) -> Vec<u8> {
-        // "depthidx:" + 8-char hex + ":" + event_id
-        let formatted = format!("depthidx:{:08x}:{}", depth, event_id);
+        let formatted = format!(
+            "depthidx:{:0width$x}:{}",
+            depth,
+            event_id,
+            width = DEPTH_IDX_HEX_WIDTH
+        );
         formatted.into_bytes()
     }
 
-    /// Prefix for all events at a specific depth: `depthidx:{depth:08x}:`
+    /// Prefix for all events at a specific depth: `depthidx:{depth:016x}:`
     fn depth_idx_prefix_for_depth(depth: u64) -> Vec<u8> {
-        format!("depthidx:{:08x}:", depth).into_bytes()
+        format!(
+            "depthidx:{:0width$x}:",
+            depth,
+            width = DEPTH_IDX_HEX_WIDTH
+        )
+        .into_bytes()
     }
 
     fn creator_key(creator: &str, event_id: &EventId) -> Vec<u8> {
@@ -659,13 +670,13 @@ impl EventStoreBackend for RocksDBEventStore {
             }
 
             for key in keys {
-                // Key format: "depthidx:{depth:08x}:{event_id}"
+                // Key format: "depthidx:{depth:016x}:{event_id}"
                 let key_str = match String::from_utf8(key) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                // Skip past "depthidx:XXXXXXXX:"
-                let event_id = match key_str.get(("depthidx:".len() + 8 + 1)..) {
+                let event_id_start = key_prefix::DEPTH_IDX.len() + DEPTH_IDX_HEX_WIDTH + 1;
+                let event_id = match key_str.get(event_id_start..) {
                     Some(id) if !id.is_empty() => id.to_string(),
                     _ => continue,
                 };
@@ -719,9 +730,11 @@ impl EventStoreBackend for RocksDBEventStore {
         let idx_prefix = key_prefix::DEPTH_IDX;
         if let Ok(keys) = self.db.prefix_scan_keys(ColumnFamily::Events, idx_prefix) {
             if let Some(last_key) = keys.last() {
-                // Key format: "depthidx:{depth:08x}:{event_id}"
+                // Key format: "depthidx:{depth:016x}:{event_id}"
                 if let Ok(key_str) = String::from_utf8(last_key.clone()) {
-                    if let Some(hex_str) = key_str.get("depthidx:".len().."depthidx:".len() + 8) {
+                    let depth_start = key_prefix::DEPTH_IDX.len();
+                    let depth_end = depth_start + DEPTH_IDX_HEX_WIDTH;
+                    if let Some(hex_str) = key_str.get(depth_start..depth_end) {
                         if let Ok(depth) = u64::from_str_radix(hex_str, 16) {
                             return Some(depth);
                         }
@@ -773,6 +786,111 @@ mod tests {
             setu_types::VLCSnapshot::new(),
             creator.to_string(),
         )
+    }
+
+    #[test]
+    fn depthidx_key_uses_full_u64_width() {
+        let event_id: EventId = "event-high".to_string();
+        let key = String::from_utf8(RocksDBEventStore::depth_idx_key(0x1_0000_0000, &event_id))
+            .expect("depthidx key must be utf8");
+        assert_eq!(key, "depthidx:0000000100000000:event-high");
+
+        let prefix = String::from_utf8(RocksDBEventStore::depth_idx_prefix_for_depth(
+            0x1_0000_0000,
+        ))
+        .expect("depthidx prefix must be utf8");
+        assert_eq!(prefix, "depthidx:0000000100000000:");
+    }
+
+    #[tokio::test]
+    async fn depthidx_get_max_depth_orders_across_u32_boundary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+        let store = RocksDBEventStore::new(
+            SetuDB::open_default(temp_dir.path()).expect("test db must open"),
+        );
+        let low_depth = 0xffff_ffff;
+        let high_depth = 0x1_0000_0000;
+
+        store
+            .store_with_depth(test_event("depth-low"), low_depth)
+            .await
+            .expect("low depth event must store");
+        store
+            .store_with_depth(test_event("depth-high"), high_depth)
+            .await
+            .expect("high depth event must store");
+
+        assert_eq!(store.get_max_depth().await, Some(high_depth));
+    }
+
+    #[tokio::test]
+    async fn depthidx_range_returns_events_across_u32_boundary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+        let store = RocksDBEventStore::new(
+            SetuDB::open_default(temp_dir.path()).expect("test db must open"),
+        );
+        let low_depth = 0xffff_ffff;
+        let high_depth = 0x1_0000_0000;
+        let low_event = test_event("depth-range-low");
+        let high_event = test_event("depth-range-high");
+        let low_id = low_event.id.clone();
+        let high_id = high_event.id.clone();
+
+        store
+            .store_with_depth(low_event, low_depth)
+            .await
+            .expect("low depth event must store");
+        store
+            .store_with_depth(high_event, high_depth)
+            .await
+            .expect("high depth event must store");
+
+        let events = store
+            .get_events_by_depth_range(low_depth, high_depth)
+            .await
+            .expect("depth range must load");
+        let observed: Vec<(EventId, u64)> = events
+            .into_iter()
+            .map(|(event, depth)| (event.id, depth))
+            .collect();
+
+        assert_eq!(observed, vec![(low_id, low_depth), (high_id, high_depth)]);
+    }
+
+    #[tokio::test]
+    async fn depthidx_range_orders_multiple_events_at_high_depth() {
+        let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+        let store = RocksDBEventStore::new(
+            SetuDB::open_default(temp_dir.path()).expect("test db must open"),
+        );
+        let depth = 0x1_0000_0000;
+        let event_a = test_event("depth-same-a");
+        let event_b = test_event("depth-same-b");
+        let mut expected = vec![event_a.id.clone(), event_b.id.clone()];
+        expected.sort();
+
+        store
+            .store_with_depth(event_b, depth)
+            .await
+            .expect("event b must store");
+        store
+            .store_with_depth(event_a, depth)
+            .await
+            .expect("event a must store");
+
+        let events = store
+            .get_events_by_depth_range(depth, depth)
+            .await
+            .expect("depth range must load");
+        let observed: Vec<EventId> = events
+            .into_iter()
+            .map(|(event, event_depth)| {
+                assert_eq!(event_depth, depth);
+                event.id
+            })
+            .collect();
+
+        assert_eq!(observed, expected);
     }
 
     #[tokio::test]

@@ -1174,6 +1174,22 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         info!("✓ Heartbeat CF task started (5s interval)");
+
+        // Task D — Periodic maintenance: time out stale pending CFs so a
+        // single stuck CF cannot permanently hold the in-flight
+        // `pending_builds` slot (BUG-010 follow-up). 2s cadence is short
+        // enough to recover quickly after a partial vote loss; the actual
+        // timeout threshold is governed by `cf_timeout_ms`.
+        let maintenance_cv = Arc::clone(&consensus_validator);
+        let _maintenance_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                maintenance_cv.run_periodic_maintenance().await;
+            }
+        });
+        info!("✓ Periodic maintenance task started (2s interval)");
     }
 
     // Spawn HTTP server

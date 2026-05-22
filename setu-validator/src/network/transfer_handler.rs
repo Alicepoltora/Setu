@@ -49,7 +49,6 @@ impl TransferHandler {
         task_preparer: &TaskPreparer,
         coin_reservation_manager: &CoinReservationManager,
         transfer_status: &Arc<DashMap<String, TransferTracker>>,
-        solver_pending_transfers: &Arc<DashMap<String, Vec<String>>>,
         transfer_counter: &AtomicU64,
         vlc_time: u64,
         request: SubmitTransferRequest,
@@ -201,14 +200,6 @@ impl TransferHandler {
                 created_at: now,
             },
         );
-
-        // Add to reverse index for O(1) lookup during TEE completion
-        if let Some(ref sid) = solver_id {
-            solver_pending_transfers
-                .entry(sid.clone())
-                .or_insert_with(Vec::new)
-                .push(transfer_id.clone());
-        }
 
         // Step 6: Execute Solver INLINE (await) → release coin → submit consensus
         //
@@ -393,7 +384,6 @@ impl TransferHandler {
         batch_preparer: &BatchTaskPreparer,
         coin_reservation_manager: &CoinReservationManager,
         transfer_status: &Arc<DashMap<String, TransferTracker>>,
-        solver_pending_transfers: &Arc<DashMap<String, Vec<String>>>,
         transfer_counter: &AtomicU64,
         vlc_counter: &AtomicU64,
         request: SubmitTransfersBatchRequest,
@@ -554,12 +544,6 @@ impl TransferHandler {
                                 created_at: now,
                             },
                         );
-
-                        // Add to reverse index
-                        solver_pending_transfers
-                            .entry(solver_id.clone())
-                            .or_insert_with(Vec::new)
-                            .push(transfer_id.clone());
 
                         // Spawn TEE task with reservation (reservation will be released after task completion)
                         tee_executor.spawn_tee_task_with_reservation(

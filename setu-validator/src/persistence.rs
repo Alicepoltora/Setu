@@ -202,6 +202,7 @@ pub trait FinalizationPersister: Send + Sync {
             // late-queued CF index entries so they do not leak; a failure
             // here may still escalate after MAX_CF_INDEX_RETRIES tries.
             self.persist_pending_finalized_cfs().await?;
+            self.engine().mark_anchor_persisted(&anchor.id).await;
             debug!(anchor_id = %anchor.id, "Anchor already persisted, skipping (idempotent)");
             return Ok(());
         }
@@ -418,7 +419,7 @@ mod tests {
                     // mirrors warn!(...) — error is logged then swallowed
                 }
             } else {
-                cf_store.mark_finalized(&cf.id).await;
+                let _ = cf_store.mark_finalized(&cf.id).await;
             }
         }
         pending

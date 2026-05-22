@@ -15,7 +15,6 @@
 //!
 //! This module implements several optimizations for high throughput:
 //! - DashMap for lock-free concurrent access to transfer_status, events, solver_info
-//! - Reverse index (solver_pending_transfers) to avoid O(n) scans
 //! - Lock-free VLC allocation via atomic counter
 
 use super::registration::ValidatorRegistrationHandler;
@@ -102,9 +101,6 @@ pub struct ValidatorNetworkService {
 
     /// Transfer tracking - uses DashMap for lock-free concurrent access
     transfer_status: Arc<DashMap<String, TransferTracker>>,
-
-    /// Reverse index: solver_id -> pending transfer_ids (for O(1) lookup)
-    solver_pending_transfers: Arc<DashMap<String, Vec<String>>>,
 
     /// Event storage - uses DashMap for lock-free concurrent access
     events: Arc<DashMap<String, Event>>,
@@ -216,7 +212,6 @@ impl ValidatorNetworkService {
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             transfer_status,
-            solver_pending_transfers: Arc::new(DashMap::new()),
             events,
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events,
@@ -304,7 +299,6 @@ impl ValidatorNetworkService {
             solver_channels: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             transfer_status,
-            solver_pending_transfers: Arc::new(DashMap::new()),
             events,
             pending_events: Arc::new(RwLock::new(Vec::new())),
             dag_events,
@@ -620,7 +614,6 @@ impl ValidatorNetworkService {
             &self.task_preparer,
             &self.coin_reservation_manager,
             &self.transfer_status,
-            &self.solver_pending_transfers,
             &self.transfer_counter,
             vlc_time,
             request,
@@ -658,7 +651,6 @@ impl ValidatorNetworkService {
             &self.batch_task_preparer,
             &self.coin_reservation_manager,
             &self.transfer_status,
-            &self.solver_pending_transfers,
             &self.transfer_counter,
             &self.vlc_counter,
             request,
@@ -2374,6 +2366,33 @@ mod tests {
         });
     }
 
+    async fn assert_invalid_subnet_request_rejected(
+        request: setu_rpc::RegisterSubnetRequest,
+        rejected_subnet_id: &str,
+        expected_markers: &[&str],
+    ) {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler.register_subnet(request).await;
+
+        assert!(!response.success);
+        assert_eq!(response.subnet_id, None);
+        assert_eq!(response.event_id, None);
+        assert!(
+            expected_markers
+                .iter()
+                .all(|marker| response.message.contains(marker)),
+            "message '{}' did not contain expected markers {:?}",
+            response.message,
+            expected_markers
+        );
+        assert!(!response.message.contains("forced submit failure"));
+        assert!(service.get_subnet_info(rejected_subnet_id).is_none());
+        assert!(service.forced_add_event_response.read().is_some());
+    }
+
     fn seed_membership(service: &ValidatorNetworkService, address: &str, subnet_id: &str) {
         let membership_key = format!("user:{}:subnet:{}", address, subnet_id);
         let membership_oid = setu_types::ObjectId::new(
@@ -2544,6 +2563,156 @@ mod tests {
         assert_eq!(response.event_id, None);
         assert!(response.message.contains("forced submit failure"));
         assert!(service.get_subnet_info("subnet-fail").is_none());
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_empty_subnet_id() {
+        let request = sample_subnet_request("");
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "",
+            &["Invalid subnet_id", "empty"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_whitespace_subnet_id() {
+        let request = sample_subnet_request("   ");
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "   ",
+            &["Invalid subnet_id", "empty"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_malformed_subnet_id_with_spaces() {
+        let request = sample_subnet_request("p0 bad id test");
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "p0 bad id test",
+            &["Invalid subnet_id"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_uppercase_subnet_id() {
+        let request = sample_subnet_request("P0-App");
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "P0-App",
+            &["Invalid subnet_id", "lowercase"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_reserved_subnet_id() {
+        let root_request = sample_subnet_request("ROOT");
+        assert_invalid_subnet_request_rejected(
+            root_request,
+            "ROOT",
+            &["Invalid subnet_id", "reserved"],
+        )
+        .await;
+
+        let governance_request = sample_subnet_request("governance");
+        assert_invalid_subnet_request_rejected(
+            governance_request,
+            "governance",
+            &["Invalid subnet_id", "reserved"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_empty_name() {
+        let mut request = sample_subnet_request("p0-empty-name-test");
+        request.name = "".to_string();
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "p0-empty-name-test",
+            &["Invalid subnet name", "empty"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_whitespace_name() {
+        let mut request = sample_subnet_request("p0-whitespace-name-test");
+        request.name = "  ".to_string();
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "p0-whitespace-name-test",
+            &["Invalid subnet name", "empty"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_rejects_name_with_control_char() {
+        let mut request = sample_subnet_request("p0-control-name-test");
+        request.name = "bad\nname".to_string();
+
+        assert_invalid_subnet_request_rejected(
+            request,
+            "p0-control-name-test",
+            &["Invalid subnet name", "control"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn register_subnet_validates_before_duplicate_check() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        let invalid_id = "p0 bad id duplicate";
+        add_test_subnet(&service, invalid_id);
+        service.force_next_add_event_to_dag_response(forced_submit_failure());
+
+        let response = handler
+            .register_subnet(sample_subnet_request(invalid_id))
+            .await;
+
+        assert!(!response.success);
+        assert_eq!(response.subnet_id, None);
+        assert_eq!(response.event_id, None);
+        assert!(response.message.contains("Invalid subnet_id"));
+        assert!(!response.message.contains("already registered"));
+        assert!(!response.message.contains("forced submit failure"));
+        assert!(service.get_subnet_info(invalid_id).is_some());
+        assert!(service.forced_add_event_response.read().is_some());
+    }
+
+    #[tokio::test]
+    async fn register_subnet_accepts_valid_slug_and_name() {
+        let service = create_test_service();
+        let handler = service.registration_handler();
+        let mut request = sample_subnet_request("p0-valid-app");
+        request.name = "P0 Valid App".to_string();
+
+        let response = handler.register_subnet(request).await;
+
+        assert!(response.success, "{}", response.message);
+        assert_eq!(response.subnet_id, Some("p0-valid-app".to_string()));
+        assert!(response
+            .event_id
+            .as_ref()
+            .map(|event_id| !event_id.is_empty())
+            .unwrap_or(false));
+        let subnet = service
+            .get_subnet_info("p0-valid-app")
+            .expect("valid subnet should be registered");
+        assert_eq!(subnet.name, "P0 Valid App");
     }
 
     #[tokio::test]

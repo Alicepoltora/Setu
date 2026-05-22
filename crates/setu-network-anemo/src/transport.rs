@@ -6,6 +6,7 @@
 use crate::{config::AnemoConfig, error::Result, AnemoError};
 use anemo::{Network, PeerId, Router};
 use bytes::Bytes;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use tracing::{debug, info};
 
@@ -17,13 +18,27 @@ pub struct AnemoTransport {
 }
 
 impl AnemoTransport {
-    /// Create a new AnemoTransport with default echo service
+    /// Create a new AnemoTransport with a default echo service
     pub async fn new(config: &AnemoConfig) -> Result<Self> {
-        Self::with_router(config, Router::new()).await
+        let echo_service = tower::service_fn(|request: anemo::Request<Bytes>| async move {
+            Ok::<_, Infallible>(anemo::Response::new(request.into_body()))
+        });
+        Self::with_service(config, echo_service).await
     }
 
     /// Create a new AnemoTransport with a custom router
     pub async fn with_router(config: &AnemoConfig, router: Router) -> Result<Self> {
+        Self::with_service(config, router).await
+    }
+
+    async fn with_service<S>(config: &AnemoConfig, service: S) -> Result<Self>
+    where
+        S: tower::Service<anemo::Request<Bytes>, Response = anemo::Response<Bytes>, Error = Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
         info!("Initializing Anemo transport on {}", config.listen_addr);
 
         // Parse listen address
@@ -43,12 +58,12 @@ impl AnemoTransport {
             key
         });
 
-        // Build the network with the router
+        // Build the network with the service
         let network = Network::bind(listen_addr)
             .server_name(&config.server_name)
             .private_key(private_key)
             .config(anemo_config)
-            .start(router)?;
+            .start(service)?;
 
         info!(
             "Anemo network started on {} with PeerId: {}",
@@ -170,7 +185,10 @@ mod tests {
         let transport2 = AnemoTransport::new(&config2).await.unwrap();
 
         // Connect transport1 to transport2
-        let peer_id = transport1.connect(transport2.local_addr()).await.unwrap();
+        let peer_id = transport1
+            .connect_with_peer_id(transport2.local_addr(), transport2.peer_id())
+            .await
+            .unwrap();
         assert_eq!(peer_id, transport2.peer_id());
 
         // Verify connection
@@ -201,6 +219,7 @@ mod tests {
         let request = anemo::Request::new(message.clone());
         let response = transport1.rpc(peer_id, request).await.unwrap();
 
+        assert_eq!(response.status(), anemo::types::response::StatusCode::Success);
         assert_eq!(response.into_body(), message);
     }
 }

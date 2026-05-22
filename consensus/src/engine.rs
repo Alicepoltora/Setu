@@ -29,11 +29,31 @@ use tracing::{debug, info, warn};
 use crate::broadcaster::ConsensusBroadcaster;
 use crate::dag::Dag;
 use crate::dag_manager::{DagManager, DagManagerError};
-use crate::folder::ConsensusManager;
+use crate::folder::{CfLifecycleOutcome, ConsensusManager};
 use crate::liveness::Round;
 use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
 use crate::vlc::VLC;
+
+/// Completion queue entry: tracks CF with per-anchor persistence status.
+///
+/// Layer A (fix-post-restart-finality-stall-v2) defers CF broadcast and round
+/// advancement until after anchor persistence succeeds. This struct ensures
+/// only successfully-persisted anchors trigger broadcast.
+///
+/// See `docs/feat/fix-submit-event-batch-hole/design.md` for batch invariant
+/// protection.
+#[derive(Debug, Clone)]
+struct CompletionEntry {
+    /// The finalized ConsensusFrame waiting for broadcast
+    cf: ConsensusFrame,
+    /// AnchorId that produced this CF (tracks which anchor must persist first)
+    anchor_id: setu_types::AnchorId,
+    /// Expected round at finalize time (idempotency guard)
+    expected_round: Round,
+    /// Whether this anchor has been durably persisted
+    persisted: bool,
+}
 
 /// Messages exchanged between consensus components
 #[derive(Debug, Clone)]
@@ -96,11 +116,16 @@ pub struct ConsensusEngine {
     /// round-drift window (see fix-post-restart-finality-stall-v2 design.md
     /// Layer A and review-log.md R3-VERIFY-4/8).
     ///
-    /// Each entry is `(ConsensusFrame, expected_round)` where `expected_round`
-    /// is the validator-set round captured at finalize time. The completion
-    /// step only advances the round if it still matches `expected_round`,
-    /// making the call idempotent under restart / duplicate dispatch.
-    pending_completions: Arc<Mutex<Vec<(ConsensusFrame, Round)>>>,
+    /// Each entry tracks a CF with its associated anchor_id, expected round, and
+    /// persistence status. The completion step only advances the round if it
+    /// still matches the entry's expected round, making the call idempotent
+    /// under restart / duplicate dispatch.
+    /// Only CFs for anchors that have been marked as persisted (via
+    /// `mark_anchor_persisted()`) are processed by `complete_pending_finalizations()`.
+    /// This protects against the batch-hole invariant violation where one anchor
+    /// fails to persist but its CF is still broadcast.
+    /// See `docs/feat/fix-submit-event-batch-hole/design.md` for details.
+    pending_completions: Arc<Mutex<Vec<CompletionEntry>>>,
     /// Broadcast channel for CF finalization notifications.
     /// Injected by caller (ConsensusValidator) via set_finalization_tx().
     /// Uses parking_lot::RwLock: broadcast::Sender::send() is synchronous.
@@ -342,12 +367,23 @@ impl ConsensusEngine {
     ///   peer-driven `receive_finalized_cf` for the same CF on a later tick),
     ///   we do not double-advance.
     pub async fn complete_pending_finalizations(&self) -> SetuResult<()> {
-        let pending: Vec<(ConsensusFrame, Round)> = {
+        // Collect persisted entries and remove them from queue
+        let pending: Vec<CompletionEntry> = {
             let mut q = self.pending_completions.lock().await;
-            std::mem::take(&mut *q)
+            let mut result = Vec::new();
+            q.retain(|e| {
+                if e.persisted {
+                    result.push(e.clone());
+                    false // remove from queue
+                } else {
+                    true // keep in queue
+                }
+            });
+            result
         };
-
-        for (cf, expected_round) in pending {
+        for entry in pending {
+            let cf = entry.cf;
+            let expected_round = entry.expected_round;
             let cf_id = cf.id.clone();
 
             // Internal channel (legacy local listeners).
@@ -405,6 +441,27 @@ impl ConsensusEngine {
     #[cfg(test)]
     pub async fn pending_completions_len(&self) -> usize {
         self.pending_completions.lock().await.len()
+    }
+
+    /// Mark an anchor as durably persisted for completion queue purposes.
+    ///
+    /// When an anchor persists successfully, call this to unblock its associated
+    /// CF from being broadcasted by `complete_pending_finalizations()`.
+    ///
+    /// This ensures Layer A invariant: no CF broadcast without prior anchor persist.
+    /// See `docs/feat/fix-submit-event-batch-hole/design.md` for details.
+    pub async fn mark_anchor_persisted(&self, anchor_id: &setu_types::AnchorId) {
+        {
+            let mut q = self.pending_completions.lock().await;
+            for entry in q.iter_mut() {
+                if entry.anchor_id == *anchor_id {
+                    entry.persisted = true;
+                }
+            }
+        }
+
+        let mut manager = self.consensus_manager.write().await;
+        manager.mark_anchor_persisted(anchor_id);
     }
 
     /// Mark finalized anchor events as no longer pending in the active DAG.
@@ -735,9 +792,11 @@ impl ConsensusEngine {
                 debug!(cf_id = %frame.id, "Leader self-voted for CF");
 
                 // Check if this vote causes finalization (single-node mode)
-                if manager.check_finalization(&frame.id)
-                    && Self::manager_last_finalized_matches(&manager, &frame.id)
-                {
+                let outcome = manager.classify_finalization(&frame.id);
+                if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                    warn!(cf_id = %frame.id, ?failure, "CF dropped on apply failure (single-node path)");
+                }
+                if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                     // Immediately update depth floor so new events land above anchor_depth.
                     // This is critical: without it, events referencing old parents (e.g., genesis)
                     // would get a depth below anchor_depth, causing permanent InsufficientEvents.
@@ -968,9 +1027,11 @@ impl ConsensusEngine {
 
             // Check if our vote caused finalization
             // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let finalized = manager.check_finalization(&cf_id)
-                && Self::manager_last_finalized_matches(&manager, &cf_id);
-            if finalized {
+            let outcome = manager.classify_finalization(&cf_id);
+            if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_cf path)");
+            }
+            if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                 return self.handle_finalization(&mut manager).await;
             }
         }
@@ -1033,9 +1094,11 @@ impl ConsensusEngine {
         manager.apply_cf_state_changes(&dag, &cf);
         drop(dag);
 
-        let finalized = manager.receive_finalized_cf(cf.clone())
-            && Self::manager_last_finalized_matches(&manager, &cf.id);
-        if finalized {
+        let outcome = manager.receive_finalized_cf(cf.clone());
+        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+            warn!(cf_id = %cf.id, ?failure, "CF dropped on apply failure (receive_finalized_cf path)");
+        }
+        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
             return self.handle_finalization(&mut manager).await;
         }
 
@@ -1311,7 +1374,7 @@ impl ConsensusEngine {
     /// 1. `dag_manager.update_min_depth(...)`
     /// 2. `mark_anchor_events_finalized_in_active_dag(...)`
     /// 3. push to `pending_persist_cfs` (durable index queue)
-    /// 4. push `(cf, expected_round)` to `pending_completions` (post-persist queue)
+    /// 4. push `CompletionEntry` to `pending_completions` (post-persist queue)
     ///
     /// Note: This method extracts data from manager before acquiring other locks
     /// to avoid potential deadlock from holding multiple write locks.
@@ -1347,7 +1410,12 @@ impl ConsensusEngine {
             };
             {
                 let mut q = self.pending_completions.lock().await;
-                q.push((cf.clone(), expected_round));
+                q.push(CompletionEntry {
+                    cf: cf.clone(),
+                    anchor_id: anchor.id.clone(),
+                    expected_round,
+                    persisted: false,
+                });
             }
 
             debug!(
@@ -1362,16 +1430,6 @@ impl ConsensusEngine {
         };
 
         Ok((true, finalized_anchor))
-    }
-
-    fn manager_last_finalized_matches(
-        manager: &ConsensusManager,
-        cf_id: &str,
-    ) -> bool {
-        manager
-            .last_finalized_cf()
-            .map(|cf| cf.id == cf_id)
-            .unwrap_or(false)
     }
 
     /// Receive a vote from another validator
@@ -1399,10 +1457,12 @@ impl ConsensusEngine {
 
         let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
-        let finalized = manager.receive_vote(vote)
-            && Self::manager_last_finalized_matches(&manager, &cf_id);
+        let outcome = manager.receive_vote(vote);
+        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+            warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_vote path)");
+        }
 
-        if finalized {
+        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
             self.handle_finalization(&mut manager).await
         } else {
             Ok((false, None))
@@ -1462,13 +1522,36 @@ impl ConsensusEngine {
         manager.anchor_count()
     }
 
-    /// Mark an anchor as successfully persisted to storage
+    /// Periodic maintenance: time-out stale pending CFs.
     ///
-    /// Call this after successfully storing the anchor to AnchorStore.
-    /// This enables safe garbage collection of finalized CFs from memory.
-    pub async fn mark_anchor_persisted(&self, anchor_id: &str) {
-        let mut manager = self.consensus_manager.write().await;
-        manager.mark_anchor_persisted(anchor_id);
+    /// BUG-010 follow-up: pending_builds is gated on `pending_cfs.is_empty()`,
+    /// so a pending CF that never reaches quorum (e.g. partial vote loss)
+    /// would block all future builds. Invoking `cleanup_timeout_cfs` on a
+    /// fixed cadence drops such CFs once `cf_timeout_ms` has elapsed,
+    /// unblocking the next build. Also clears any matching
+    /// `last_apply_failure` so the diagnostic does not outlive its CF.
+    ///
+    /// Idempotent: when there is nothing to time out, this is a cheap
+    /// no-op holding the manager write lock only briefly.
+    pub async fn run_periodic_maintenance(&self) {
+        let (removed, pending_builds_len, pending_cfs_len) = {
+            let mut manager = self.consensus_manager.write().await;
+            let removed = manager.cleanup_timeout_cfs();
+            (
+                removed,
+                manager.pending_builds_len(),
+                manager.pending_cfs_len(),
+            )
+        };
+        if removed > 0 {
+            tracing::debug!(
+                target: "consensus::diag::maintenance",
+                removed,
+                pending_builds_len,
+                pending_cfs_len,
+                "Periodic maintenance: timed-out CFs removed"
+            );
+        }
     }
 
     /// Heartbeat attempt to create a CF for low-frequency events.
@@ -1508,9 +1591,11 @@ impl ConsensusEngine {
 
             let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
             if self_vote.is_some() {
-                if manager.check_finalization(&frame.id)
-                    && Self::manager_last_finalized_matches(&manager, &frame.id)
-                {
+                let outcome = manager.classify_finalization(&frame.id);
+                if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                    warn!(cf_id = %frame.id, ?failure, "CF dropped on apply failure (heartbeat path)");
+                }
+                if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
                     self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
@@ -1739,6 +1824,7 @@ pub struct DagStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::broadcaster::MockBroadcaster;
     use setu_types::{Anchor, AnchorMerkleRoots, EventType, NodeInfo, ValidatorInfo};
     use setu_vlc::VectorClock;
     use std::collections::HashMap;
@@ -1813,6 +1899,9 @@ mod tests {
         assert!(anchor.is_some());
         // Layer A: round advance is deferred until complete_pending_finalizations.
         assert_eq!(engine.current_round().await, 0);
+        engine
+            .mark_anchor_persisted(&anchor.as_ref().unwrap().id)
+            .await;
         engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
 
@@ -1853,8 +1942,124 @@ mod tests {
         assert!(anchor.is_some());
         // Layer A: deferred until completion drains.
         assert_eq!(engine.current_round().await, 0);
+        engine
+            .mark_anchor_persisted(&anchor.as_ref().unwrap().id)
+            .await;
         engine.complete_pending_finalizations().await.unwrap();
         assert_eq!(engine.current_round().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_completion_does_not_broadcast_before_anchor_marked_persisted() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v2".to_string(), create_validator_set());
+        let broadcaster = Arc::new(MockBroadcaster::new("v2".to_string(), 2));
+        engine.set_broadcaster(broadcaster.clone()).await;
+
+        let anchor = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
+        cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
+        cf.finalize();
+        let cf_id = cf.id.clone();
+
+        let (finalized, anchor) = engine.receive_finalized_cf(cf).await.unwrap();
+        let anchor = anchor.expect("finalized CF should return anchor");
+        assert!(finalized);
+
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 0);
+        assert_eq!(engine.pending_completions_len().await, 1);
+        assert!(broadcaster.get_finalized_broadcasts().is_empty());
+
+        engine.mark_anchor_persisted(&anchor.id).await;
+        {
+            let manager = engine.consensus_manager.read().await;
+            assert!(manager.has_persisted_anchor_for_testing(&anchor.id));
+        }
+
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(engine.current_round().await, 1);
+        assert_eq!(engine.pending_completions_len().await, 0);
+        assert_eq!(broadcaster.get_finalized_broadcasts(), vec![cf_id]);
+    }
+
+    #[tokio::test]
+    async fn test_partial_persisted_batch_only_completes_marked_anchor() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1,
+            min_events_per_cf: 1,
+            max_events_per_cf: 1000,
+            cf_timeout_ms: 5000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        let broadcaster = Arc::new(MockBroadcaster::new("v1".to_string(), 2));
+        engine.set_broadcaster(broadcaster.clone()).await;
+
+        let anchor1 = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root-1".to_string(),
+            None,
+            0,
+        );
+        let anchor2 = Anchor::new(
+            vec![],
+            VLCSnapshot::default(),
+            "state-root-2".to_string(),
+            Some(anchor1.id.clone()),
+            1,
+        );
+        let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
+        let cf2 = ConsensusFrame::new(anchor2.clone(), "v1".to_string());
+        {
+            let mut q = engine.pending_completions.lock().await;
+            q.push(CompletionEntry {
+                cf: cf1.clone(),
+                anchor_id: anchor1.id.clone(),
+                expected_round: 0,
+                persisted: false,
+            });
+            q.push(CompletionEntry {
+                cf: cf2.clone(),
+                anchor_id: anchor2.id.clone(),
+                expected_round: 0,
+                persisted: false,
+            });
+        }
+
+        engine.mark_anchor_persisted(&anchor1.id).await;
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(broadcaster.get_finalized_broadcasts(), vec![cf1.id.clone()]);
+        assert_eq!(engine.pending_completions_len().await, 1);
+        assert_eq!(engine.current_round().await, 1);
+
+        engine.mark_anchor_persisted(&anchor2.id).await;
+        engine.complete_pending_finalizations().await.unwrap();
+        assert_eq!(
+            broadcaster.get_finalized_broadcasts(),
+            vec![cf1.id.clone(), cf2.id.clone()]
+        );
+        assert_eq!(engine.pending_completions_len().await, 0);
+        assert_eq!(
+            engine.current_round().await,
+            1,
+            "synthetic entries share expected_round=0, so the second completion is idempotent"
+        );
     }
 
     #[tokio::test]
@@ -2231,7 +2436,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_follower_synchronizes_anchor_chain_root() {
+    async fn test_follower_rejects_cf_with_mismatched_global_state_root() {
+        // BUG-010 regression: previously check_finalization called
+        // anchor_builder.synchronize_finalized_anchor() on apply error and
+        // pushed the CF into finalized_cfs, advancing anchor_chain_root
+        // without any real state apply. The fix is fail-closed — apply
+        // errors now drop the CF and record last_apply_failure.
+        // See docs/feat/fix-bug010-finality-stall/design.md.
         use setu_types::{merkle::AnchorMerkleRoots, Anchor, EventType};
 
         let config = ConsensusConfig {
@@ -2241,15 +2452,11 @@ mod tests {
             ..Default::default()
         };
 
-        // Create leader engine
         let leader_engine =
             ConsensusEngine::new(config.clone(), "v1".to_string(), create_validator_set());
-
-        // Create follower engine
         let follower_engine =
             ConsensusEngine::new(config.clone(), "v2".to_string(), create_validator_set());
 
-        // Both start with same anchor_chain_root
         let initial_root = leader_engine.get_anchor_chain_root().await;
         assert_eq!(initial_root, [0u8; 32], "Initial root should be zero");
         assert_eq!(
@@ -2258,7 +2465,6 @@ mod tests {
             "Both nodes should start with same root"
         );
 
-        // Leader creates events and CF
         for i in 0..3 {
             let mut event = Event::new(
                 EventType::System,
@@ -2270,12 +2476,10 @@ mod tests {
                 },
                 "v1".to_string(),
             );
-            // Add execution result for state changes
             event.execution_result = Some(setu_types::ExecutionResult::success());
             let _ = leader_engine.add_event(event).await;
         }
 
-        // Try to create CF (needs enough VLC delta)
         {
             let mut vlc = leader_engine.vlc.write().await;
             for _ in 0..10 {
@@ -2284,11 +2488,11 @@ mod tests {
         }
 
         let _cf_opt = leader_engine.try_create_cf().await;
-        // CF creation might fail due to various reasons (min events, etc)
-        // For this test, we simulate a CF manually
 
-        // Create a CF with correct merkle roots
-        let correct_merkle_roots =
+        // Construct a CF with no events but a non-zero declared global_state_root.
+        // The follower's local apply (over zero events) cannot reproduce
+        // [2u8; 32], so RootMismatch must fire and the CF must be dropped.
+        let mismatched_roots =
             AnchorMerkleRoots::with_roots([1u8; 32], [2u8; 32], initial_root);
 
         let anchor = Anchor::with_merkle_roots(
@@ -2298,54 +2502,55 @@ mod tests {
                 logical_time: 10,
                 physical_time: 0,
             },
-            correct_merkle_roots,
+            mismatched_roots,
             None,
             0,
         );
 
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
 
-        // Follower receives and finalizes CF
-        // Note: receive_cf will fail at various checks, but we can test the manager directly
         {
             let mut manager = follower_engine.consensus_manager.write().await;
             manager.receive_cf(cf.clone());
 
-            // Add votes to reach quorum (simulate 3 validators)
             let vote1 = Vote::new("v1".to_string(), cf.id.clone(), true);
             let vote2 = Vote::new("v2".to_string(), cf.id.clone(), true);
             let vote3 = Vote::new("v3".to_string(), cf.id.clone(), true);
 
             manager.receive_vote(vote1);
             manager.receive_vote(vote2);
-            let finalized = manager.receive_vote(vote3);
+            let outcome = manager.receive_vote(vote3);
 
-            assert!(finalized, "CF should be finalized after quorum");
-
-            // Check that anchor_chain_root was updated
-            let updated_root = manager.anchor_builder().anchor_chain_root();
-            assert_ne!(
-                updated_root, initial_root,
-                "Anchor chain root should have been updated"
+            // Quorum is reached but apply fails → fail-closed.
+            assert!(
+                !outcome.is_finalized(),
+                "CF must NOT finalize when follower apply fails (BUG-010 fix): {:?}",
+                outcome
+            );
+            assert!(
+                !manager.is_finalized_cf(&cf.id),
+                "Failed-apply CF must not be marked finalized"
             );
 
-            // Verify it matches the expected computation
-            let expected_root = {
-                let anchor_hash = anchor.compute_hash();
-                setu_types::hash_utils::chain_hash(&initial_root, &anchor_hash)
-            };
+            let failure = manager
+                .last_apply_failure()
+                .expect("last_apply_failure must be set on follower apply error");
+            assert_eq!(failure.cf_id, cf.id);
 
+            // anchor_chain_root MUST remain at initial_root: no spurious
+            // synchronize_finalized_anchor call. This is the core BUG-010
+            // invariant — apply failure must not pollute downstream state.
+            let post_root = manager.anchor_builder().anchor_chain_root();
             assert_eq!(
-                updated_root, expected_root,
-                "Anchor chain root should match expected chain hash"
+                post_root, initial_root,
+                "Anchor chain root must NOT advance when apply fails"
             );
         }
 
-        // Verify follower can now accept next CF with updated root
         let follower_root = follower_engine.get_anchor_chain_root().await;
-        assert_ne!(
+        assert_eq!(
             follower_root, initial_root,
-            "Follower root should be updated"
+            "Follower root must stay at initial when apply fails"
         );
     }
 
@@ -2388,19 +2593,20 @@ mod tests {
         // Vote 1: approve (should not finalize yet)
         let vote1 = Vote::new("v1".to_string(), cf_id.clone(), true);
         let result1 = manager.receive_vote(vote1);
-        assert!(!result1, "Should not finalize with 1 approve vote");
+        assert!(!result1.is_terminal(), "Should not finalize with 1 approve vote: {:?}", result1);
 
         // Vote 2: reject (1 reject, not enough)
         let vote2 = Vote::new("v2".to_string(), cf_id.clone(), false);
         let result2 = manager.receive_vote(vote2);
-        assert!(!result2, "Should not reject with only 1 reject vote");
+        assert!(!result2.is_terminal(), "Should not reject with only 1 reject vote: {:?}", result2);
 
         // Vote 3: reject (2 rejects = 1/3+1, should reject)
         let vote3 = Vote::new("v3".to_string(), cf_id.clone(), false);
         let result3 = manager.receive_vote(vote3);
         assert!(
-            result3,
-            "Should reject with 2 reject votes (1/3+1 threshold)"
+            matches!(result3, crate::folder::CfLifecycleOutcome::Rejected { .. }),
+            "Should reject with 2 reject votes (1/3+1 threshold): {:?}",
+            result3
         );
 
         // Verify CF was removed from pending (can't directly access private field)
@@ -2510,8 +2716,9 @@ mod tests {
 
         // The vote processing should detect timeout and remove CF
         assert!(
-            result,
-            "Should return true when CF is removed due to timeout"
+            result.is_terminal(),
+            "Should return terminal outcome when CF is removed due to timeout: {:?}",
+            result
         );
     }
 
@@ -2562,7 +2769,7 @@ mod tests {
         manager.receive_vote(vote1);
         let rejected = manager.receive_vote(vote2);
 
-        assert!(rejected, "CF should be rejected with 2 reject votes");
+        assert!(rejected.is_terminal(), "CF should be rejected with 2 reject votes: {:?}", rejected);
 
         // Verify the CF is removed
         assert!(
@@ -2576,5 +2783,55 @@ mod tests {
 
         // For a true test of rollback, we'd need to use try_create_cf which actually
         // modifies anchor_builder state. This test verifies the reject path works.
+    }
+
+    /// BUG-010 follow-up / Test #8: `run_periodic_maintenance` removes a
+    /// timed-out pending CF so the Step 2 guard slot is freed.
+    #[tokio::test]
+    async fn followup_periodic_maintenance_logs_and_removes() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 50,
+            validator_count: 4,
+        };
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        let cf = ConsensusFrame::new(anchor, "v1".to_string());
+
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            manager.receive_cf(cf);
+            assert_eq!(manager.pending_cfs_len(), 1);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+
+        engine.run_periodic_maintenance().await;
+
+        let manager = engine.consensus_manager.read().await;
+        assert_eq!(
+            manager.pending_cfs_len(),
+            0,
+            "run_periodic_maintenance must remove timed-out CFs"
+        );
     }
 }
