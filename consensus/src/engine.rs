@@ -2409,7 +2409,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_follower_synchronizes_anchor_chain_root() {
+    async fn test_follower_rejects_cf_with_mismatched_global_state_root() {
+        // BUG-010 regression: previously check_finalization called
+        // anchor_builder.synchronize_finalized_anchor() on apply error and
+        // pushed the CF into finalized_cfs, advancing anchor_chain_root
+        // without any real state apply. The fix is fail-closed — apply
+        // errors now drop the CF and record last_apply_failure.
+        // See docs/feat/fix-bug010-finality-stall/design.md.
         use setu_types::{merkle::AnchorMerkleRoots, Anchor, EventType};
 
         let config = ConsensusConfig {
@@ -2419,15 +2425,11 @@ mod tests {
             ..Default::default()
         };
 
-        // Create leader engine
         let leader_engine =
             ConsensusEngine::new(config.clone(), "v1".to_string(), create_validator_set());
-
-        // Create follower engine
         let follower_engine =
             ConsensusEngine::new(config.clone(), "v2".to_string(), create_validator_set());
 
-        // Both start with same anchor_chain_root
         let initial_root = leader_engine.get_anchor_chain_root().await;
         assert_eq!(initial_root, [0u8; 32], "Initial root should be zero");
         assert_eq!(
@@ -2436,7 +2438,6 @@ mod tests {
             "Both nodes should start with same root"
         );
 
-        // Leader creates events and CF
         for i in 0..3 {
             let mut event = Event::new(
                 EventType::System,
@@ -2448,12 +2449,10 @@ mod tests {
                 },
                 "v1".to_string(),
             );
-            // Add execution result for state changes
             event.execution_result = Some(setu_types::ExecutionResult::success());
             let _ = leader_engine.add_event(event).await;
         }
 
-        // Try to create CF (needs enough VLC delta)
         {
             let mut vlc = leader_engine.vlc.write().await;
             for _ in 0..10 {
@@ -2462,11 +2461,11 @@ mod tests {
         }
 
         let _cf_opt = leader_engine.try_create_cf().await;
-        // CF creation might fail due to various reasons (min events, etc)
-        // For this test, we simulate a CF manually
 
-        // Create a CF with correct merkle roots
-        let correct_merkle_roots =
+        // Construct a CF with no events but a non-zero declared global_state_root.
+        // The follower's local apply (over zero events) cannot reproduce
+        // [2u8; 32], so RootMismatch must fire and the CF must be dropped.
+        let mismatched_roots =
             AnchorMerkleRoots::with_roots([1u8; 32], [2u8; 32], initial_root);
 
         let anchor = Anchor::with_merkle_roots(
@@ -2476,20 +2475,17 @@ mod tests {
                 logical_time: 10,
                 physical_time: 0,
             },
-            correct_merkle_roots,
+            mismatched_roots,
             None,
             0,
         );
 
         let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
 
-        // Follower receives and finalizes CF
-        // Note: receive_cf will fail at various checks, but we can test the manager directly
         {
             let mut manager = follower_engine.consensus_manager.write().await;
             manager.receive_cf(cf.clone());
 
-            // Add votes to reach quorum (simulate 3 validators)
             let vote1 = Vote::new("v1".to_string(), cf.id.clone(), true);
             let vote2 = Vote::new("v2".to_string(), cf.id.clone(), true);
             let vote3 = Vote::new("v3".to_string(), cf.id.clone(), true);
@@ -2498,32 +2494,35 @@ mod tests {
             manager.receive_vote(vote2);
             let finalized = manager.receive_vote(vote3);
 
-            assert!(finalized, "CF should be finalized after quorum");
-
-            // Check that anchor_chain_root was updated
-            let updated_root = manager.anchor_builder().anchor_chain_root();
-            assert_ne!(
-                updated_root, initial_root,
-                "Anchor chain root should have been updated"
+            // Quorum is reached but apply fails → fail-closed.
+            assert!(
+                !finalized,
+                "CF must NOT finalize when follower apply fails (BUG-010 fix)"
+            );
+            assert!(
+                !manager.is_finalized_cf(&cf.id),
+                "Failed-apply CF must not be marked finalized"
             );
 
-            // Verify it matches the expected computation
-            let expected_root = {
-                let anchor_hash = anchor.compute_hash();
-                setu_types::hash_utils::chain_hash(&initial_root, &anchor_hash)
-            };
+            let failure = manager
+                .last_apply_failure()
+                .expect("last_apply_failure must be set on follower apply error");
+            assert_eq!(failure.cf_id, cf.id);
 
+            // anchor_chain_root MUST remain at initial_root: no spurious
+            // synchronize_finalized_anchor call. This is the core BUG-010
+            // invariant — apply failure must not pollute downstream state.
+            let post_root = manager.anchor_builder().anchor_chain_root();
             assert_eq!(
-                updated_root, expected_root,
-                "Anchor chain root should match expected chain hash"
+                post_root, initial_root,
+                "Anchor chain root must NOT advance when apply fails"
             );
         }
 
-        // Verify follower can now accept next CF with updated root
         let follower_root = follower_engine.get_anchor_chain_root().await;
-        assert_ne!(
+        assert_eq!(
             follower_root, initial_root,
-            "Follower root should be updated"
+            "Follower root must stay at initial when apply fails"
         );
     }
 

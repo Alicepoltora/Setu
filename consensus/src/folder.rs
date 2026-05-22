@@ -87,6 +87,34 @@ impl DagFolder {
     }
 }
 
+/// Role classification for a CF that was discarded by `check_finalization`
+/// due to a state-apply error. Used by `ApplyFailure` for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyFailureRole {
+    /// Leader path: `commit_build` returned a non-`SnapshotMismatch` error.
+    LeaderCommitError,
+    /// Leader path: `commit_build` returned `SnapshotMismatch`, follower fallback
+    /// (`apply_follower_finalized_cf`) then returned an error.
+    LeaderFollowerFallback,
+    /// Follower path: deferred apply (`apply_follower_finalized_cf`) returned an error.
+    Follower,
+}
+
+/// Diagnostic record for a CF that reached quorum but failed state-apply.
+///
+/// Stored on `ConsensusManager` and overwritten on every new apply failure.
+/// The failed CF is NOT pushed into `finalized_cfs` and the engine does NOT
+/// persist/broadcast/advance-round for it. Events referenced by the failed CF
+/// remain in `dag.events` and will be re-folded into a future CF.
+#[derive(Debug, Clone)]
+pub struct ApplyFailure {
+    pub cf_id: String,
+    pub anchor_id: String,
+    pub anchor_depth: u64,
+    pub role: ApplyFailureRole,
+    pub reason: String,
+}
+
 /// ConsensusManager with integrated AnchorBuilder for Merkle tree management
 /// 
 /// This manager handles:
@@ -128,6 +156,10 @@ pub struct ConsensusManager {
     local_validator_id: String,
     /// Last build result for diagnostics
     last_build_result: Option<AnchorBuildResult>,
+    /// Most recent apply-failure observed by `check_finalization`.
+    /// Overwritten on each failure; cleared on construction.
+    /// Read by tests and operational diagnostics; never persisted or broadcast.
+    last_apply_failure: Option<ApplyFailure>,
 }
 
 impl ConsensusManager {
@@ -145,6 +177,7 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            last_apply_failure: None,
         }
     }
     
@@ -166,6 +199,7 @@ impl ConsensusManager {
             persisted_anchor_ids: std::collections::HashSet::new(),
             local_validator_id: validator_id,
             last_build_result: None,
+            last_apply_failure: None,
         }
     }
 
@@ -188,6 +222,19 @@ impl ConsensusManager {
         dag: &Dag,
         vlc: &VLC,
     ) -> Option<ConsensusFrame> {
+        // BUG-010 Step 2: enforce one open pending_build per local proposer.
+        // current_round only advances after the local proposer's own CF finalizes,
+        // so any entry in pending_builds belongs to the current round / current
+        // anchor depth. Creating a second CF here would prepare against the same
+        // pre-state base and inevitably hit SnapshotMismatch on the loser CF.
+        if !self.pending_builds.is_empty() {
+            tracing::debug!(
+                pending_builds = self.pending_builds.len(),
+                "try_create_cf skipped: pending_build already open for current round"
+            );
+            return None;
+        }
+
         // D1: compute the set of event-ids already referenced by in-flight CFs
         // (leader's pending_builds + follower's pending_cf_events). Passed to
         // prepare_build so the pending-status selection excludes them.
@@ -278,6 +325,13 @@ impl ConsensusManager {
     #[cfg(test)]
     pub fn pending_counts_for_testing(&self) -> (usize, usize) {
         (self.pending_cfs.len(), self.pending_cf_events.len())
+    }
+
+    /// Number of open pending_builds (test-only).
+    /// Used by BUG-010 regression tests to verify the Step 2 guard contract.
+    #[cfg(test)]
+    pub fn pending_builds_len_for_testing(&self) -> usize {
+        self.pending_builds.len()
     }
 
     pub fn receive_cf(&mut self, cf: ConsensusFrame) {
@@ -418,75 +472,125 @@ impl ConsensusManager {
             Some(CFDecision::Finalize) => {
                 if let Some(mut cf) = self.pending_cfs.remove(cf_id) {
                     cf.finalize();
-                    
-                    // Check if this is our CF (we have a pending_build for it)
-                    if let Some(pending_build) = self.pending_builds.remove(cf_id) {
-                        // Leader path: commit the pending build
-                        // Clean up stored events (Leader uses pending_build's events)
-                        self.pending_cf_events.remove(cf_id);
-                        tracing::info!(cf_id = %cf_id, "Leader path: committing pending build");
-                        match self.anchor_builder.commit_build(pending_build.clone()) {
-                            Ok(state_summary) => {
-                                tracing::info!(
-                                    cf_id = %cf_id,
-                                    total_events = state_summary.total_events,
-                                    total_changes = state_summary.total_changes,
-                                    conflicted = state_summary.conflicted_events.len(),
-                                    "Leader path: commit_build succeeded"
-                                );
-                                // Store result for diagnostics
-                                self.last_build_result = Some(AnchorBuildResult {
-                                    anchor: cf.anchor.clone(),
-                                    state_summary,
-                                    routed_events: pending_build.routed_events,
-                                });
-                            }
-                            Err(AnchorBuildError::SnapshotMismatch { .. }) => {
-                                // Another CF was committed first - use Follower path
-                                tracing::warn!(cf_id = %cf_id, "Snapshot mismatch during commit, falling back to follower path");
-                                let events = pending_build.all_events();
-                                if let Err(e) = self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
-                                    tracing::error!(cf_id = %cf_id, error = %e, "Follower fallback failed, syncing metadata only");
-                                    self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                    let anchor_id = cf.anchor.id.clone();
+                    let anchor_depth = cf.anchor.depth;
+
+                    // Outcome of the apply attempt. Only Ok(()) pushes the CF into
+                    // finalized_cfs; Err(_) discards the CF, records the failure, and
+                    // causes check_finalization to return false so the engine's
+                    // existing `manager_last_finalized_matches` guard skips persist/
+                    // broadcast/round-advance. Events stay in dag.events for re-folding.
+                    // See docs/feat/fix-bug010-finality-stall/design.md.
+                    let apply_outcome: Result<(), ApplyFailure> =
+                        if let Some(pending_build) = self.pending_builds.remove(cf_id) {
+                            // Leader path: commit the pending build
+                            // Clean up stored events (Leader uses pending_build's events)
+                            self.pending_cf_events.remove(cf_id);
+                            tracing::info!(cf_id = %cf_id, "Leader path: committing pending build");
+                            match self.anchor_builder.commit_build(pending_build.clone()) {
+                                Ok(state_summary) => {
+                                    tracing::info!(
+                                        cf_id = %cf_id,
+                                        total_events = state_summary.total_events,
+                                        total_changes = state_summary.total_changes,
+                                        conflicted = state_summary.conflicted_events.len(),
+                                        "Leader path: commit_build succeeded"
+                                    );
+                                    // Store result for diagnostics
+                                    self.last_build_result = Some(AnchorBuildResult {
+                                        anchor: cf.anchor.clone(),
+                                        state_summary,
+                                        routed_events: pending_build.routed_events,
+                                    });
+                                    Ok(())
+                                }
+                                Err(AnchorBuildError::SnapshotMismatch { .. }) => {
+                                    // Another CF was committed first - use Follower path
+                                    tracing::warn!(cf_id = %cf_id, "Snapshot mismatch during commit, falling back to follower path");
+                                    let events = pending_build.all_events();
+                                    match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                                        Ok(_) => Ok(()),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                cf_id = %cf_id, error = %e,
+                                                "Follower fallback failed; discarding CF (BUG-010 fail-closed)"
+                                            );
+                                            Err(ApplyFailure {
+                                                cf_id: cf_id.to_string(),
+                                                anchor_id: anchor_id.clone(),
+                                                anchor_depth,
+                                                role: ApplyFailureRole::LeaderFollowerFallback,
+                                                reason: e.to_string(),
+                                            })
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Other error - discard CF (BUG-010 fail-closed)
+                                    tracing::error!(
+                                        cf_id = %cf_id, error = %e,
+                                        "commit_build failed; discarding CF (BUG-010 fail-closed)"
+                                    );
+                                    Err(ApplyFailure {
+                                        cf_id: cf_id.to_string(),
+                                        anchor_id: anchor_id.clone(),
+                                        anchor_depth,
+                                        role: ApplyFailureRole::LeaderCommitError,
+                                        reason: e.to_string(),
+                                            })
                                 }
                             }
-                            Err(e) => {
-                                // Other error - sync metadata at minimum
-                                tracing::error!(cf_id = %cf_id, error = %e, "Commit failed, syncing metadata only");
-                                self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
+                        } else {
+                            // Follower path: apply state at finalization time (deferred apply).
+                            // Events were stored in pending_cf_events when the CF arrived.
+                            // Applying here (not on arrival) guarantees correct ordering:
+                            // CFs finalize in Leader commit order, so the write GSM base
+                            // state always matches what the Leader computed against.
+                            let events = self.pending_cf_events.remove(cf_id).unwrap_or_default();
+                            tracing::info!(cf_id = %cf_id, event_count = events.len(), "Follower path: applying deferred state");
+                            match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
+                                Ok(state_summary) => {
+                                    tracing::info!(
+                                        cf_id = %cf_id,
+                                        total_events = state_summary.total_events,
+                                        total_changes = state_summary.total_changes,
+                                        "Follower path: state applied and committed"
+                                    );
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        cf_id = %cf_id, error = %e,
+                                        "Follower deferred apply failed; discarding CF (BUG-010 fail-closed)"
+                                    );
+                                    Err(ApplyFailure {
+                                        cf_id: cf_id.to_string(),
+                                        anchor_id: anchor_id.clone(),
+                                        anchor_depth,
+                                        role: ApplyFailureRole::Follower,
+                                        reason: e.to_string(),
+                                    })
+                                }
                             }
+                        };
+
+                    match apply_outcome {
+                        Ok(()) => {
+                            self.last_apply_failure = None;
+                            self.finalized_cfs.push(cf);
+                            self.gc_finalized_cfs();
+                            return true;
                         }
-                    } else {
-                        // Follower path: apply state at finalization time (deferred apply).
-                        // Events were stored in pending_cf_events when the CF arrived.
-                        // Applying here (not on arrival) guarantees correct ordering:
-                        // CFs finalize in Leader commit order, so the write GSM base
-                        // state always matches what the Leader computed against.
-                        let events = self.pending_cf_events.remove(cf_id).unwrap_or_default();
-                        tracing::info!(cf_id = %cf_id, event_count = events.len(), "Follower path: applying deferred state");
-                        match self.anchor_builder.apply_follower_finalized_cf(&events, &cf) {
-                            Ok(state_summary) => {
-                                tracing::info!(
-                                    cf_id = %cf_id,
-                                    total_events = state_summary.total_events,
-                                    total_changes = state_summary.total_changes,
-                                    "Follower path: state applied and committed"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(cf_id = %cf_id, error = %e,
-                                    "Follower deferred apply failed, syncing metadata only");
-                                self.anchor_builder.synchronize_finalized_anchor(&cf.anchor);
-                            }
+                        Err(failure) => {
+                            // CF discarded; do NOT push to finalized_cfs, do NOT call
+                            // synchronize_finalized_anchor. last_finalized_cf() therefore
+                            // does not advance, and the engine's
+                            // manager_last_finalized_matches guard correctly skips
+                            // persist/broadcast/round-advance for this cf_id.
+                            self.last_apply_failure = Some(failure);
+                            return false;
                         }
                     }
-                    
-                    self.finalized_cfs.push(cf);
-                    
-                    // Trigger safe garbage collection
-                    self.gc_finalized_cfs();
-                    
-                    return true;
                 }
             }
             Some(CFDecision::Reject) | Some(CFDecision::Timeout) => {
@@ -664,6 +768,13 @@ impl ConsensusManager {
     pub fn last_build_result(&self) -> Option<&AnchorBuildResult> {
         self.last_build_result.as_ref()
     }
+
+    /// Get the most recent apply-failure observed by `check_finalization`.
+    /// Returns `None` if no apply failure has occurred since construction or the
+    /// last successful finalization.
+    pub fn last_apply_failure(&self) -> Option<&ApplyFailure> {
+        self.last_apply_failure.as_ref()
+    }
     
     /// Get a subnet's current state root
     pub fn get_subnet_root(&self, subnet_id: &setu_types::SubnetId) -> Option<[u8; 32]> {
@@ -747,7 +858,7 @@ impl ConsensusManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use setu_types::{Event, EventType, VLCSnapshot};
+    use setu_types::{Event, EventType, VLCSnapshot, AnchorMerkleRoots};
 
     fn create_vlc(node_id: &str, time: u64) -> VLC {
         let mut vlc = VLC::new(node_id.to_string());
@@ -874,5 +985,175 @@ mod tests {
         assert!(manager.receive_finalized_cf(finalized_cf));
         assert!(manager.is_finalized_cf(&cf_id));
         assert!(!manager.receive_finalized_cf(duplicate_finalized_cf));
+    }
+
+    // ------------------------------------------------------------------
+    // BUG-010 regression tests.
+    // See docs/feat/fix-bug010-finality-stall/design.md.
+    // ------------------------------------------------------------------
+
+    /// Step 2 guard: try_create_cf must skip when a pending_build is already
+    /// open for the current round (one proposer => one in-flight CF).
+    #[test]
+    fn bug010_try_create_cf_skips_when_pending_build_open() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+
+        let first = manager.try_create_cf(&dag, &vlc);
+        assert!(first.is_some(), "first try_create_cf should produce a CF");
+
+        // Second call must be skipped by the Step 2 guard because the first
+        // CF's pending_build is still open (not yet finalized).
+        let second = manager.try_create_cf(&dag, &vlc);
+        assert!(
+            second.is_none(),
+            "second try_create_cf must return None while pending_build is open"
+        );
+    }
+
+    /// Step 2 guard: once the pending_build is drained (CF finalizes
+    /// successfully), the guard no longer blocks new CF creation.
+    /// We assert the guard's direct precondition (pending_builds emptiness)
+    /// rather than driving a second try_create_cf, which depends on unrelated
+    /// vlc/delta thresholds and dag growth.
+    #[test]
+    fn bug010_pending_builds_drained_after_successful_finalize() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 1, // self-quorum for instant finalize
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+
+        let cf = manager.try_create_cf(&dag, &vlc).expect("first CF");
+        let cf_id = cf.id.clone();
+        assert_eq!(
+            manager.pending_builds_len_for_testing(),
+            1,
+            "pending_build must be open after try_create_cf"
+        );
+
+        manager.vote_for_cf(&cf_id, true, None);
+        assert!(manager.check_finalization(&cf_id), "CF should finalize");
+
+        assert_eq!(
+            manager.pending_builds_len_for_testing(),
+            0,
+            "pending_builds must be empty after successful finalize \
+             (Step 2 guard would otherwise permanently block new CFs)"
+        );
+    }
+
+    /// Step 1 fail-closed: a follower-path CF whose declared global_state_root
+    /// does NOT match the locally-computed root must be DROPPED:
+    ///   - check_finalization returns false
+    ///   - the CF is NOT pushed into finalized_cfs
+    ///   - last_apply_failure records the Follower role
+    ///   - last_finalized_cf remains unchanged (no spurious advance)
+    ///
+    /// This is the core BUG-010 regression: previously the error branch called
+    /// synchronize_finalized_anchor + finalized_cfs.push, lying to the engine
+    /// that the CF had finalized despite no state apply.
+    #[test]
+    fn bug010_follower_apply_failure_drops_cf_and_does_not_advance() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 3,
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(3);
+
+        // Build a foreign-looking CF directly (NOT via try_create_cf), so
+        // pending_builds stays empty and check_finalization takes the
+        // follower deferred-apply path.
+        let event_ids: Vec<_> = dag.all_events().map(|e| e.id.clone()).collect();
+        assert_eq!(event_ids.len(), 3);
+
+        let bad_roots = AnchorMerkleRoots {
+            events_root: [0u8; 32],
+            global_state_root: [0xFFu8; 32], // intentionally wrong
+            anchor_chain_root: [0u8; 32],
+            subnet_roots: Default::default(),
+        };
+        let anchor = Anchor::with_merkle_roots(
+            event_ids,
+            vlc.snapshot(),
+            bad_roots,
+            None,
+            0,
+        );
+        let cf = ConsensusFrame::new(anchor, "v2".to_string());
+        let cf_id = cf.id.clone();
+
+        // Receive the CF and inject its events into pending_cf_events so the
+        // follower deferred-apply path has work to do.
+        manager.receive_cf(cf.clone());
+        assert!(manager.apply_cf_state_changes(&dag, &cf));
+
+        // Drive to quorum: self vote + two foreign votes via receive_finalized_cf.
+        manager.vote_for_cf(&cf_id, true, None);
+        let mut quorum_cf = cf.clone();
+        quorum_cf.add_vote(Vote::new("v1".to_string(), cf_id.clone(), true));
+        quorum_cf.add_vote(Vote::new("v2".to_string(), cf_id.clone(), true));
+        quorum_cf.add_vote(Vote::new("v3".to_string(), cf_id.clone(), true));
+
+        let finalized_ok = manager.receive_finalized_cf(quorum_cf);
+
+        // The CF must be REJECTED (apply failed → fail-closed).
+        assert!(
+            !finalized_ok,
+            "receive_finalized_cf must return false when follower apply fails"
+        );
+        assert!(
+            !manager.is_finalized_cf(&cf_id),
+            "failed-apply CF must NOT be marked finalized"
+        );
+        assert!(
+            manager.last_finalized_cf().is_none(),
+            "last_finalized_cf must stay None (no spurious advance)"
+        );
+
+        let failure = manager
+            .last_apply_failure()
+            .expect("last_apply_failure must be populated on follower apply error");
+        assert_eq!(failure.cf_id, cf_id);
+        assert_eq!(failure.role, ApplyFailureRole::Follower);
+        assert!(
+            !failure.reason.is_empty(),
+            "failure.reason should carry the underlying error text"
+        );
+    }
+
+    /// Regression: a CF that applies cleanly on the leader path still finalizes
+    /// and clears any prior last_apply_failure record.
+    #[test]
+    fn bug010_successful_apply_finalizes_and_clears_failure() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            validator_count: 1, // self-quorum
+            ..Default::default()
+        };
+        let mut manager = ConsensusManager::new(config, "v1".to_string());
+        let (dag, vlc) = setup_dag_with_events(10);
+
+        let cf = manager.try_create_cf(&dag, &vlc).expect("CF");
+        let cf_id = cf.id.clone();
+        manager.vote_for_cf(&cf_id, true, None);
+        assert!(manager.check_finalization(&cf_id));
+
+        assert!(manager.is_finalized_cf(&cf_id));
+        assert!(manager.last_apply_failure().is_none());
+        assert!(manager.last_finalized_cf().is_some());
     }
 }
