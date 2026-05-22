@@ -24,6 +24,57 @@ pub struct ValidatorRegistrationHandler {
     pub(crate) service: Arc<ValidatorNetworkService>,
 }
 
+fn validate_public_subnet_id(raw: &str) -> Result<String, &'static str> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("Invalid subnet_id: must not be empty");
+    }
+    if value != raw {
+        return Err("Invalid subnet_id: leading/trailing whitespace is not allowed");
+    }
+    if value.len() < 3 || value.len() > 64 {
+        return Err("Invalid subnet_id: length must be 3-64 characters");
+    }
+    if value.eq_ignore_ascii_case("root") || value.eq_ignore_ascii_case("governance") {
+        return Err("Invalid subnet_id: reserved system id");
+    }
+
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err("Invalid subnet_id: must not be empty");
+    };
+    let last = value.chars().last().unwrap_or(first);
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return Err("Invalid subnet_id: must start and end with a letter or digit");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err("Invalid subnet_id: only lowercase letters, digits, and '-' are allowed");
+    }
+
+    Ok(value.to_string())
+}
+
+fn validate_public_subnet_name(raw: &str) -> Result<String, &'static str> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("Invalid subnet name: must not be empty");
+    }
+    if value != raw {
+        return Err("Invalid subnet name: leading/trailing whitespace is not allowed");
+    }
+    if raw.chars().count() > 128 {
+        return Err("Invalid subnet name: length must be <= 128 characters");
+    }
+    if raw.chars().any(|ch| ch.is_control()) {
+        return Err("Invalid subnet name: control characters are not allowed");
+    }
+
+    Ok(raw.to_string())
+}
+
 #[async_trait::async_trait]
 impl RegistrationHandler for ValidatorRegistrationHandler {
     async fn register_solver(&self, request: RegisterSolverRequest) -> RegisterSolverResponse {
@@ -222,21 +273,45 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
     }
 
     async fn register_subnet(&self, request: RegisterSubnetRequest) -> RegisterSubnetResponse {
+        let subnet_id = match validate_public_subnet_id(&request.subnet_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return RegisterSubnetResponse {
+                    success: false,
+                    message: message.to_string(),
+                    subnet_id: None,
+                    event_id: None,
+                };
+            }
+        };
+
+        let subnet_name = match validate_public_subnet_name(&request.name) {
+            Ok(value) => value,
+            Err(message) => {
+                return RegisterSubnetResponse {
+                    success: false,
+                    message: message.to_string(),
+                    subnet_id: None,
+                    event_id: None,
+                };
+            }
+        };
+
         info!(
-            subnet_id = %request.subnet_id,
-            name = %request.name,
+            subnet_id = %subnet_id,
+            name = %subnet_name,
             owner = %request.owner,
             token_symbol = %request.token_symbol,
             "Processing subnet registration"
         );
 
         // Check if already registered
-        if self.service.get_subnet_info(&request.subnet_id).is_some() {
-            warn!(subnet_id = %request.subnet_id, "Subnet already registered");
+        if self.service.get_subnet_info(&subnet_id).is_some() {
+            warn!(subnet_id = %subnet_id, "Subnet already registered");
             return RegisterSubnetResponse {
                 success: false,
-                message: format!("Subnet '{}' is already registered", request.subnet_id),
-                subnet_id: Some(request.subnet_id),
+                message: format!("Subnet '{}' is already registered", subnet_id),
+                subnet_id: Some(subnet_id),
                 event_id: None,
             };
         }
@@ -309,8 +384,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
 
         // Build SubnetRegistration
         let mut registration = SubnetRegistration::new(
-            request.subnet_id.clone(),
-            request.name.clone(),
+            subnet_id.clone(),
+            subnet_name.clone(),
             request.owner.clone(),
             request.token_symbol.clone(),
         )
@@ -358,7 +433,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         {
             Ok(event) => event,
             Err(e) => {
-                tracing::error!(subnet_id = %request.subnet_id, error = %e,
+                tracing::error!(subnet_id = %subnet_id, error = %e,
                     "InfraExecutor subnet registration failed");
                 return RegisterSubnetResponse {
                     success: false,
@@ -375,7 +450,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         let submit_response = self.service.add_event_to_dag(event).await;
         if !submit_response.success {
             warn!(
-                subnet_id = %request.subnet_id,
+                subnet_id = %subnet_id,
                 message = %submit_response.message,
                 "Subnet registration DAG submission failed"
             );
@@ -388,8 +463,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
 
         self.service.add_subnet(SubnetInfo {
-            subnet_id: request.subnet_id.clone(),
-            name: request.name.clone(),
+            subnet_id: subnet_id.clone(),
+            name: subnet_name,
             owner: request.owner.clone(),
             subnet_type: format!("{:?}", registration.subnet_type),
             token_symbol: request.token_symbol.clone(),
@@ -401,7 +476,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         });
 
         info!(
-            subnet_id = %request.subnet_id,
+            subnet_id = %subnet_id,
             event_id = %&event_id[..20.min(event_id.len())],
             "Subnet registered successfully"
         );
@@ -409,7 +484,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         RegisterSubnetResponse {
             success: true,
             message: "Subnet registered successfully".to_string(),
-            subnet_id: Some(request.subnet_id),
+            subnet_id: Some(subnet_id),
             event_id: Some(event_id),
         }
     }
