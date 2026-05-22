@@ -934,6 +934,16 @@ impl ConsensusValidator {
 
         Ok(())
     }
+
+    /// Periodic maintenance: time out stale pending CFs.
+    ///
+    /// BUG-010 follow-up: Task D in `main.rs` ticks this on a 2s cadence so
+    /// a pending CF that never reaches quorum cannot permanently block the
+    /// one-in-flight `pending_builds` slot. Thin forwarder to
+    /// `ConsensusEngine::run_periodic_maintenance`.
+    pub async fn run_periodic_maintenance(&self) {
+        self.engine.run_periodic_maintenance().await;
+    }
     
     /// Get the local validator ID
     pub fn validator_id(&self) -> &str {

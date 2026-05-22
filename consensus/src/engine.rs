@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 use crate::broadcaster::ConsensusBroadcaster;
 use crate::dag::Dag;
 use crate::dag_manager::{DagManager, DagManagerError};
-use crate::folder::ConsensusManager;
+use crate::folder::{CfLifecycleOutcome, ConsensusManager};
 use crate::liveness::Round;
 use crate::outcome_sink::OutcomeSink;
 use crate::validator_set::ValidatorSet;
@@ -792,9 +792,11 @@ impl ConsensusEngine {
                 debug!(cf_id = %frame.id, "Leader self-voted for CF");
 
                 // Check if this vote causes finalization (single-node mode)
-                if manager.check_finalization(&frame.id)
-                    && Self::manager_last_finalized_matches(&manager, &frame.id)
-                {
+                let outcome = manager.classify_finalization(&frame.id);
+                if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                    warn!(cf_id = %frame.id, ?failure, "CF dropped on apply failure (single-node path)");
+                }
+                if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                     // Immediately update depth floor so new events land above anchor_depth.
                     // This is critical: without it, events referencing old parents (e.g., genesis)
                     // would get a depth below anchor_depth, causing permanent InsufficientEvents.
@@ -1025,9 +1027,11 @@ impl ConsensusEngine {
 
             // Check if our vote caused finalization
             // (vote_for_cf adds vote but doesn't check finalization, so we check here)
-            let finalized = manager.check_finalization(&cf_id)
-                && Self::manager_last_finalized_matches(&manager, &cf_id);
-            if finalized {
+            let outcome = manager.classify_finalization(&cf_id);
+            if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_cf path)");
+            }
+            if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                 return self.handle_finalization(&mut manager).await;
             }
         }
@@ -1090,9 +1094,11 @@ impl ConsensusEngine {
         manager.apply_cf_state_changes(&dag, &cf);
         drop(dag);
 
-        let finalized = manager.receive_finalized_cf(cf.clone())
-            && Self::manager_last_finalized_matches(&manager, &cf.id);
-        if finalized {
+        let outcome = manager.receive_finalized_cf(cf.clone());
+        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+            warn!(cf_id = %cf.id, ?failure, "CF dropped on apply failure (receive_finalized_cf path)");
+        }
+        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
             return self.handle_finalization(&mut manager).await;
         }
 
@@ -1426,16 +1432,6 @@ impl ConsensusEngine {
         Ok((true, finalized_anchor))
     }
 
-    fn manager_last_finalized_matches(
-        manager: &ConsensusManager,
-        cf_id: &str,
-    ) -> bool {
-        manager
-            .last_finalized_cf()
-            .map(|cf| cf.id == cf_id)
-            .unwrap_or(false)
-    }
-
     /// Receive a vote from another validator
     ///
     /// Returns (finalized, Option<Anchor>) - the anchor is returned when finalized
@@ -1461,10 +1457,12 @@ impl ConsensusEngine {
 
         let cf_id = vote.cf_id.clone();
         let mut manager = self.consensus_manager.write().await;
-        let finalized = manager.receive_vote(vote)
-            && Self::manager_last_finalized_matches(&manager, &cf_id);
+        let outcome = manager.receive_vote(vote);
+        if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+            warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_vote path)");
+        }
 
-        if finalized {
+        if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
             self.handle_finalization(&mut manager).await
         } else {
             Ok((false, None))
@@ -1524,10 +1522,37 @@ impl ConsensusEngine {
         manager.anchor_count()
     }
 
-    /// Mark an anchor as successfully persisted to storage
+    /// Periodic maintenance: time-out stale pending CFs.
     ///
-    /// Call this after successfully storing the anchor to AnchorStore.
-    /// This enables safe garbage collection of finalized CFs from memory.
+    /// BUG-010 follow-up: pending_builds is gated on `pending_cfs.is_empty()`,
+    /// so a pending CF that never reaches quorum (e.g. partial vote loss)
+    /// would block all future builds. Invoking `cleanup_timeout_cfs` on a
+    /// fixed cadence drops such CFs once `cf_timeout_ms` has elapsed,
+    /// unblocking the next build. Also clears any matching
+    /// `last_apply_failure` so the diagnostic does not outlive its CF.
+    ///
+    /// Idempotent: when there is nothing to time out, this is a cheap
+    /// no-op holding the manager write lock only briefly.
+    pub async fn run_periodic_maintenance(&self) {
+        let (removed, pending_builds_len, pending_cfs_len) = {
+            let mut manager = self.consensus_manager.write().await;
+            let removed = manager.cleanup_timeout_cfs();
+            (
+                removed,
+                manager.pending_builds_len(),
+                manager.pending_cfs_len(),
+            )
+        };
+        if removed > 0 {
+            tracing::debug!(
+                target: "consensus::diag::maintenance",
+                removed,
+                pending_builds_len,
+                pending_cfs_len,
+                "Periodic maintenance: timed-out CFs removed"
+            );
+        }
+    }
 
     /// Heartbeat attempt to create a CF for low-frequency events.
     ///
@@ -1566,9 +1591,11 @@ impl ConsensusEngine {
 
             let self_vote = manager.vote_for_cf(&frame.id, true, key_ref);
             if self_vote.is_some() {
-                if manager.check_finalization(&frame.id)
-                    && Self::manager_last_finalized_matches(&manager, &frame.id)
-                {
+                let outcome = manager.classify_finalization(&frame.id);
+                if let CfLifecycleOutcome::ApplyFailed { ref failure } = outcome {
+                    warn!(cf_id = %frame.id, ?failure, "CF dropped on apply failure (heartbeat path)");
+                }
+                if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
                     let new_anchor_depth = manager.anchor_builder().anchor_depth();
                     self.dag_manager.update_min_depth(new_anchor_depth);
                     self.mark_anchor_events_finalized_in_active_dag(&frame.anchor)
@@ -2492,12 +2519,13 @@ mod tests {
 
             manager.receive_vote(vote1);
             manager.receive_vote(vote2);
-            let finalized = manager.receive_vote(vote3);
+            let outcome = manager.receive_vote(vote3);
 
             // Quorum is reached but apply fails → fail-closed.
             assert!(
-                !finalized,
-                "CF must NOT finalize when follower apply fails (BUG-010 fix)"
+                !outcome.is_finalized(),
+                "CF must NOT finalize when follower apply fails (BUG-010 fix): {:?}",
+                outcome
             );
             assert!(
                 !manager.is_finalized_cf(&cf.id),
@@ -2565,19 +2593,20 @@ mod tests {
         // Vote 1: approve (should not finalize yet)
         let vote1 = Vote::new("v1".to_string(), cf_id.clone(), true);
         let result1 = manager.receive_vote(vote1);
-        assert!(!result1, "Should not finalize with 1 approve vote");
+        assert!(!result1.is_terminal(), "Should not finalize with 1 approve vote: {:?}", result1);
 
         // Vote 2: reject (1 reject, not enough)
         let vote2 = Vote::new("v2".to_string(), cf_id.clone(), false);
         let result2 = manager.receive_vote(vote2);
-        assert!(!result2, "Should not reject with only 1 reject vote");
+        assert!(!result2.is_terminal(), "Should not reject with only 1 reject vote: {:?}", result2);
 
         // Vote 3: reject (2 rejects = 1/3+1, should reject)
         let vote3 = Vote::new("v3".to_string(), cf_id.clone(), false);
         let result3 = manager.receive_vote(vote3);
         assert!(
-            result3,
-            "Should reject with 2 reject votes (1/3+1 threshold)"
+            matches!(result3, crate::folder::CfLifecycleOutcome::Rejected { .. }),
+            "Should reject with 2 reject votes (1/3+1 threshold): {:?}",
+            result3
         );
 
         // Verify CF was removed from pending (can't directly access private field)
@@ -2687,8 +2716,9 @@ mod tests {
 
         // The vote processing should detect timeout and remove CF
         assert!(
-            result,
-            "Should return true when CF is removed due to timeout"
+            result.is_terminal(),
+            "Should return terminal outcome when CF is removed due to timeout: {:?}",
+            result
         );
     }
 
@@ -2739,7 +2769,7 @@ mod tests {
         manager.receive_vote(vote1);
         let rejected = manager.receive_vote(vote2);
 
-        assert!(rejected, "CF should be rejected with 2 reject votes");
+        assert!(rejected.is_terminal(), "CF should be rejected with 2 reject votes: {:?}", rejected);
 
         // Verify the CF is removed
         assert!(
@@ -2753,5 +2783,55 @@ mod tests {
 
         // For a true test of rollback, we'd need to use try_create_cf which actually
         // modifies anchor_builder state. This test verifies the reject path works.
+    }
+
+    /// BUG-010 follow-up / Test #8: `run_periodic_maintenance` removes a
+    /// timed-out pending CF so the Step 2 guard slot is freed.
+    #[tokio::test]
+    async fn followup_periodic_maintenance_logs_and_removes() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 10,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 50,
+            validator_count: 4,
+        };
+        let validator_set = create_validator_set();
+        let engine = ConsensusEngine::new(config, "v1".to_string(), validator_set);
+
+        let anchor = Anchor::with_merkle_roots(
+            vec![],
+            VLCSnapshot {
+                vector_clock: VectorClock::new(),
+                logical_time: 10,
+                physical_time: 0,
+            },
+            AnchorMerkleRoots {
+                events_root: [0u8; 32],
+                global_state_root: [0u8; 32],
+                anchor_chain_root: [0u8; 32],
+                subnet_roots: HashMap::new(),
+            },
+            None,
+            0,
+        );
+        let cf = ConsensusFrame::new(anchor, "v1".to_string());
+
+        {
+            let mut manager = engine.consensus_manager.write().await;
+            manager.receive_cf(cf);
+            assert_eq!(manager.pending_cfs_len(), 1);
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+
+        engine.run_periodic_maintenance().await;
+
+        let manager = engine.consensus_manager.read().await;
+        assert_eq!(
+            manager.pending_cfs_len(),
+            0,
+            "run_periodic_maintenance must remove timed-out CFs"
+        );
     }
 }
