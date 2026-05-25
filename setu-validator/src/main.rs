@@ -1193,14 +1193,67 @@ async fn main() -> anyhow::Result<()> {
         info!("✓ Periodic maintenance task started (2s interval)");
     }
 
-    // Spawn HTTP server
-    let http_service = network_service.clone();
-    let http_handle = tokio::spawn(async move {
-        info!("Starting HTTP API server...");
-        if let Err(e) = http_service.start_http_server().await {
-            error!("HTTP server error: {}", e);
+    // ========================================
+    // v3 PR-3: Startup catch-up gate
+    // ========================================
+    // Before exposing the HTTP ingress, pull any finalized CFs we missed
+    // while we were down. If catch-up succeeds, HTTP starts. If it fails
+    // (peers unreachable, apply error, budget exceeded), we log a hard
+    // error and DO NOT spawn the HTTP server — consensus inbound stays
+    // running but no new user writes are accepted. Operator must
+    // intervene (check peer connectivity, then restart this validator).
+    // See `docs/feat/post-restart-finality-stall-v3/design.md` §PR-3.
+    let catchup_outcome = {
+        use setu_validator::startup_catchup::{
+            run_startup_catch_up, CatchUpConfig, EngineCatchUpApplier, StateSyncCatchUpSource,
+        };
+        let client = setu_validator::network_adapter::StateSyncClient::new(
+            Arc::clone(&anemo_network),
+            config.node_config.node_id.clone(),
+        );
+        let source = StateSyncCatchUpSource::new(client);
+        let applier = EngineCatchUpApplier {
+            engine: consensus_validator.engine(),
+            cf_store: consensus_validator.cf_store(),
+        };
+        info!("Starting v3 startup catch-up...");
+        run_startup_catch_up(&source, &applier, CatchUpConfig::default()).await
+    };
+
+    let http_ready = match catchup_outcome {
+        Ok(stats) => {
+            info!(
+                cfs_applied = stats.cfs_applied,
+                final_depth = stats.final_depth,
+                peer_highest = stats.peer_highest_seen,
+                elapsed_ms = stats.elapsed.as_millis() as u64,
+                "✓ Startup catch-up complete; HTTP ingress is now safe to expose"
+            );
+            true
         }
-    });
+        Err(e) => {
+            error!(
+                error = %e,
+                "Startup catch-up failed; HTTP ingress will NOT start. \
+                 Consensus inbound continues; operator action required."
+            );
+            false
+        }
+    };
+
+    // Spawn HTTP server (only if catch-up succeeded)
+    let http_handle = if http_ready {
+        let http_service = network_service.clone();
+        Some(tokio::spawn(async move {
+            info!("Starting HTTP API server...");
+            if let Err(e) = http_service.start_http_server().await {
+                error!("HTTP server error: {}", e);
+            }
+        }))
+    } else {
+        warn!("HTTP API server NOT started due to failed startup catch-up");
+        None
+    };
 
     // Log startup complete
     info!("╔════════════════════════════════════════════════════════════╗");
@@ -1219,7 +1272,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for shutdown signal
     tokio::select! {
-        _ = http_handle => {
+        _ = async {
+            match http_handle {
+                Some(h) => { let _ = h.await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             info!("HTTP server stopped");
         }
         _ = tokio::signal::ctrl_c() => {
