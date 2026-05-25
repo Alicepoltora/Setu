@@ -122,6 +122,38 @@ impl CFStore {
     pub async fn pending_count(&self) -> usize {
         self.pending.read().await.len()
     }
+
+    /// Return finalized CFs with `anchor.depth > after_depth`, sorted
+    /// ascending by depth, capped at `limit`. See `CFStoreBackend` trait
+    /// doc-comment for the full contract.
+    pub async fn get_finalized_after_depth(
+        &self,
+        after_depth: u64,
+        limit: usize,
+    ) -> Vec<ConsensusFrame> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let finalized = self.finalized.read().await;
+        let mut matching: Vec<ConsensusFrame> = finalized
+            .iter()
+            .filter_map(|id| self.frames.get(id).map(|r| r.value().clone()))
+            .filter(|cf| cf.anchor.depth > after_depth)
+            .collect();
+        matching.sort_by_key(|cf| cf.anchor.depth);
+        matching.truncate(limit);
+        matching
+    }
+
+    /// Highest `anchor.depth` among finalized CFs, or 0 if none.
+    pub async fn highest_finalized_depth(&self) -> u64 {
+        let finalized = self.finalized.read().await;
+        finalized
+            .iter()
+            .filter_map(|id| self.frames.get(id).map(|r| r.value().anchor.depth))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl Clone for CFStore {
@@ -228,5 +260,109 @@ mod tests {
         let store = CFStore::new();
         let result = store.mark_finalized(&"missing-cf".to_string()).await;
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // PR-1 (post-restart-finality-stall-v3) — bounded depth-ordered reads
+    // =========================================================================
+
+    async fn store_finalized(store: &CFStore, depth: u64, validator: &str) -> CFId {
+        let cf = create_test_cf(depth, validator);
+        let id = cf.id.clone();
+        store.store(cf).await.unwrap();
+        store.mark_finalized(&id).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_empty_store() {
+        let store = CFStore::new();
+        let result = store.get_finalized_after_depth(0, 10).await;
+        assert!(result.is_empty());
+        assert_eq!(store.highest_finalized_depth().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_single_cf() {
+        let store = CFStore::new();
+        store_finalized(&store, 5, "v1").await;
+
+        let from_zero = store.get_finalized_after_depth(0, 10).await;
+        assert_eq!(from_zero.len(), 1);
+        assert_eq!(from_zero[0].anchor.depth, 5);
+
+        // strict `>`: depth==after_depth must be excluded
+        let from_five = store.get_finalized_after_depth(5, 10).await;
+        assert!(from_five.is_empty());
+
+        assert_eq!(store.highest_finalized_depth().await, 5);
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_orders_ascending() {
+        let store = CFStore::new();
+        // insertion order intentionally non-monotone
+        for depth in [7u64, 3, 5, 9, 1] {
+            store_finalized(&store, depth, "v1").await;
+        }
+        let result = store.get_finalized_after_depth(0, 100).await;
+        let depths: Vec<u64> = result.iter().map(|cf| cf.anchor.depth).collect();
+        assert_eq!(depths, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_respects_after() {
+        let store = CFStore::new();
+        for d in 1u64..=10 {
+            store_finalized(&store, d, "v1").await;
+        }
+        let result = store.get_finalized_after_depth(4, 100).await;
+        let depths: Vec<u64> = result.iter().map(|cf| cf.anchor.depth).collect();
+        assert_eq!(depths, vec![5, 6, 7, 8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_respects_limit() {
+        let store = CFStore::new();
+        for d in 1u64..=10 {
+            store_finalized(&store, d, "v1").await;
+        }
+        let result = store.get_finalized_after_depth(0, 3).await;
+        let depths: Vec<u64> = result.iter().map(|cf| cf.anchor.depth).collect();
+        assert_eq!(depths, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_limit_zero() {
+        let store = CFStore::new();
+        store_finalized(&store, 1, "v1").await;
+        store_finalized(&store, 2, "v1").await;
+        let result = store.get_finalized_after_depth(0, 0).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v3_get_finalized_after_depth_skips_pending() {
+        let store = CFStore::new();
+        // pending CF at depth 4
+        let pending_cf = create_test_cf(4, "v1");
+        store.store(pending_cf).await.unwrap();
+        // finalized CF at depth 3
+        store_finalized(&store, 3, "v2").await;
+
+        let result = store.get_finalized_after_depth(0, 100).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].anchor.depth, 3);
+    }
+
+    #[tokio::test]
+    async fn v3_highest_finalized_depth_ignores_pending() {
+        let store = CFStore::new();
+        // pending at depth 9
+        let pending_cf = create_test_cf(9, "v1");
+        store.store(pending_cf).await.unwrap();
+        // finalized at depth 5
+        store_finalized(&store, 5, "v2").await;
+        assert_eq!(store.highest_finalized_depth().await, 5);
     }
 }
