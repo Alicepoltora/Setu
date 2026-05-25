@@ -330,7 +330,7 @@ mod tests {
             None,
             0,
         );
-        let cf = ConsensusFrame::new(anchor, "validator-1".to_string());
+        let cf = ConsensusFrame::new(0, anchor, "validator-1".to_string());
 
         let msg = SetuMessage::CFProposal {
             cf: cf.clone(),
@@ -360,7 +360,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "validator-1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "validator-1".to_string());
         cf.add_vote(Vote::new("validator-1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("validator-2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("validator-3".to_string(), cf.id.clone(), true));

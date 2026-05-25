@@ -189,7 +189,7 @@ mod tests {
             None,
             depth,
         );
-        ConsensusFrame::new(anchor, validator.to_string())
+        ConsensusFrame::new(0, anchor, validator.to_string())
     }
 
     #[tokio::test]

@@ -445,7 +445,7 @@ mod tests {
             None,
             0,
         );
-        let cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         let pending = vec![cf.clone()];
 
         // No panic, no error propagation: function returns ().

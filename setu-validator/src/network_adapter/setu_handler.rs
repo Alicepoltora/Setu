@@ -458,7 +458,7 @@ mod tests {
             None,
             depth,
         );
-        ConsensusFrame::new(anchor, "proposer".to_string())
+        ConsensusFrame::new(0, anchor, "proposer".to_string())
     }
 
     async fn make_handler_with_cfs(depths: &[u64]) -> (Arc<MockStore>, SetuMessageHandler<MockStore>) {

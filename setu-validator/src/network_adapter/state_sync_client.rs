@@ -34,6 +34,7 @@ pub enum SyncError {
     Deserialize(String),
 }
 
+#[derive(Clone)]
 pub struct StateSyncClient {
     network: Arc<AnemoNetworkService>,
     local_id: String,

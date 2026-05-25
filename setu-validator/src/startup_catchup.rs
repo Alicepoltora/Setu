@@ -316,6 +316,7 @@ mod tests {
         };
         ConsensusFrame {
             id: format!("cf-{}", depth),
+            round: 0,
             anchor,
             proposer: "p".to_string(),
             status: CFStatus::Finalized,
