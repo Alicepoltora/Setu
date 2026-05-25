@@ -450,6 +450,50 @@ impl RocksDBCFStore {
         }
         Ok(())
     }
+
+    /// Probe on-disk ConsensusFrame blobs for codec/schema compatibility.
+    ///
+    /// Pick the first key under `finalized:`, resolve its `cf:{id}` blob, and
+    /// attempt a BCS decode into the current `ConsensusFrame` type. Read-only,
+    /// O(1) under the assumption that schema breaks are uniform across blobs.
+    /// Must be called at startup BEFORE any reader path consumes CFs, because
+    /// `get()` and friends use `.ok().flatten()` and would silently turn a
+    /// schema-mismatch into "no data" — leading to a silent fork.
+    pub fn validate_schema(&self) -> SetuResult<()> {
+        let keys = self.db
+            .prefix_scan_keys(ColumnFamily::ConsensusFrames, key_prefix::FINALIZED)
+            .map_err(|e| SetuError::StorageError(format!("schema probe: scan failed: {}", e)))?;
+        let Some(index_key) = keys.into_iter().next() else {
+            return Ok(());
+        };
+        let Some(cf_id) = Self::extract_cf_id_from_index_key(&index_key, key_prefix::FINALIZED) else {
+            return Err(SetuError::StorageError(format!(
+                "schema probe: corrupt finalized index key (length {})",
+                index_key.len()
+            )));
+        };
+        let cf_key = Self::cf_key(&cf_id);
+        match self.db.get_raw::<ConsensusFrame>(ColumnFamily::ConsensusFrames, &cf_key) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(SetuError::StorageError(format!(
+                "schema probe: finalized index references missing CF blob {} — DB inconsistent",
+                cf_id
+            ))),
+            Err(e) => Err(SetuError::StorageError(format!(
+                "CF schema mismatch detected: cf_id={} cannot be decoded into the current \
+                 ConsensusFrame schema. This release added a `round` field to ConsensusFrame \
+                 and is not backward-compatible with pre-v3 on-disk blobs.\n\n\
+                 Remediation:\n\
+                 1. Stop the validator process.\n\
+                 2. Back up data/ for forensics: `mv data data.bak-$(date +%s)`.\n\
+                 3. Wipe CF storage: `rm -rf data/`.\n\
+                 4. Restart; the validator will catch up from peers via the v3 \
+                 finalized-CF pull RPC.\n\n\
+                 Underlying decode error: {}",
+                cf_id, e
+            ))),
+        }
+    }
 }
 
 impl Clone for RocksDBCFStore {
@@ -676,5 +720,63 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(from_four.len(), 1);
+    }
+
+    // ========================================================================
+    // Schema guard tests (PR-4b prerequisite)
+    // ========================================================================
+
+    #[test]
+    fn validate_schema_passes_on_empty_db() {
+        let (store, _dir) = open_store();
+        store
+            .validate_schema()
+            .expect("empty DB must pass schema probe");
+    }
+
+    #[tokio::test]
+    async fn validate_schema_passes_on_current_schema() {
+        let (store, _dir) = open_store();
+        for depth in [1u64, 2, 3] {
+            store_finalized(&store, depth, "v1").await;
+        }
+        store
+            .validate_schema()
+            .expect("CFs written via current schema must decode cleanly");
+    }
+
+    #[tokio::test]
+    async fn validate_schema_rejects_undecodable_blob() {
+        let (store, _dir) = open_store();
+        let id = store_finalized(&store, 1, "v1").await;
+
+        // Overwrite the cf:{id} blob with bytes that BCS cannot decode as
+        // ConsensusFrame. Using put_raw with a Vec<u8> serialises as length-
+        // prefix + payload, which is structurally incompatible with the CF
+        // layout — same failure shape an older on-disk schema would produce.
+        let cf_key = RocksDBCFStore::cf_key(&id);
+        store
+            .db
+            .put_raw(
+                ColumnFamily::ConsensusFrames,
+                &cf_key,
+                &b"not-a-consensus-frame".to_vec(),
+            )
+            .expect("overwrite with garbage must succeed");
+
+        let err = store
+            .validate_schema()
+            .expect_err("schema probe must reject undecodable blob");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("CF schema mismatch"),
+            "error message must flag schema mismatch, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&id),
+            "error message must include the offending cf_id, got: {}",
+            msg
+        );
     }
 }

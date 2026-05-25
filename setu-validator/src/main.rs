@@ -321,7 +321,18 @@ async fn main() -> anyhow::Result<()> {
     let consensus_validator = if let Some(ref db) = db {
         // RocksDB persistence mode - reuse the single DB handle
         let event_store: Arc<dyn EventStoreBackend> = Arc::new(RocksDBEventStore::from_shared(db.clone()));
-        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(RocksDBCFStore::from_shared(db.clone()));
+        let cf_store_concrete = RocksDBCFStore::from_shared(db.clone());
+        // Guard against silent CF deserialization failures from a stale on-disk
+        // schema (e.g. pre-v3 blobs missing the `round` field). Without this
+        // probe, `get()` paths return `Ok(None)` via `.ok().flatten()` and the
+        // validator forks silently. Must run BEFORE any reader consumes CFs.
+        cf_store_concrete
+            .validate_schema()
+            .map_err(|e| anyhow::anyhow!(
+                "CF schema guard failed at startup — on-disk data is incompatible with this release: {}",
+                e
+            ))?;
+        let cf_store: Arc<dyn CFStoreBackend> = Arc::new(cf_store_concrete);
         let anchor_store: Arc<dyn AnchorStoreBackend> = Arc::new(RocksDBAnchorStore::from_shared(db.clone()));
         
         info!("✓ RocksDB backends initialized (Events, CF, Anchors, Merkle)");
