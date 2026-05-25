@@ -9,6 +9,13 @@
 //! **Note**: This module uses deprecated types from setu-protocol for backward
 //! compatibility. Future versions will use generic types defined in the
 //! application layer.
+//!
+//! TODO(v3): `StateSyncServer<T>` is a hand-rolled wrapper without anemo-build
+//! codegen / `RpcService` impl, so it is not mounted by `AnemoNetworkService`.
+//! The v3 post-restart catch-up path bypasses this module and reuses the
+//! existing `/setu` route via `SetuMessage::RequestFinalizedCFs` (see
+//! `setu-validator/src/network_adapter/state_sync_client.rs`). Either complete
+//! the codegen here or delete this module in a future cleanup.
 
 #![allow(deprecated)]
 

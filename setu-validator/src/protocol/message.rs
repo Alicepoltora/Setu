@@ -70,6 +70,20 @@ pub enum SetuMessage {
         timestamp: u64,
         nonce: u64,
     },
+
+    /// v3 catch-up: request finalized ConsensusFrames with anchor.depth > after_depth
+    RequestFinalizedCFs {
+        after_depth: u64,
+        limit: u32,
+        requester_id: String,
+    },
+
+    /// v3 catch-up: response containing finalized CFs in ascending depth order
+    FinalizedCFsResponse {
+        cfs: Vec<ConsensusFrame>,
+        highest_finalized_depth: u64,
+        responder_id: String,
+    },
 }
 
 /// Message type identifier
@@ -85,6 +99,8 @@ pub enum MessageType {
     EventsResponse,
     Ping,
     Pong,
+    RequestFinalizedCFs,
+    FinalizedCFsResponse,
 }
 
 impl SetuMessage {
@@ -99,6 +115,8 @@ impl SetuMessage {
             SetuMessage::EventsResponse { .. } => MessageType::EventsResponse,
             SetuMessage::Ping { .. } => MessageType::Ping,
             SetuMessage::Pong { .. } => MessageType::Pong,
+            SetuMessage::RequestFinalizedCFs { .. } => MessageType::RequestFinalizedCFs,
+            SetuMessage::FinalizedCFsResponse { .. } => MessageType::FinalizedCFsResponse,
         }
     }
 
@@ -106,7 +124,9 @@ impl SetuMessage {
     pub fn expects_response(&self) -> bool {
         matches!(
             self,
-            SetuMessage::RequestEvents { .. } | SetuMessage::Ping { .. }
+            SetuMessage::RequestEvents { .. }
+                | SetuMessage::Ping { .. }
+                | SetuMessage::RequestFinalizedCFs { .. }
         )
     }
 
@@ -133,6 +153,8 @@ impl SetuMessage {
             SetuMessage::EventsResponse { .. } => "/setu/events_response",
             SetuMessage::Ping { .. } => "/ping",
             SetuMessage::Pong { .. } => "/pong",
+            SetuMessage::RequestFinalizedCFs { .. } => "/setu/request_finalized_cfs",
+            SetuMessage::FinalizedCFsResponse { .. } => "/setu/finalized_cfs_response",
         }
     }
 }

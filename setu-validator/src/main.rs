@@ -612,6 +612,7 @@ async fn main() -> anyhow::Result<()> {
     let handler_store = Arc::new(ConsensusEngineStore::new(
         consensus_validator.engine(),
         consensus_validator.event_store(),
+        consensus_validator.cf_store(),
     ));
     
     // 2.3 Create SetuMessageHandler

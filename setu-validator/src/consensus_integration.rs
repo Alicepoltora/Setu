@@ -1313,6 +1313,16 @@ mod tests {
         async fn latest_finalized(&self) -> Option<ConsensusFrame> { None }
         async fn finalized_count(&self) -> usize { 0 }
         async fn pending_count(&self) -> usize { 0 }
+        async fn get_finalized_after_depth(
+            &self,
+            _after_depth: u64,
+            _limit: usize,
+        ) -> SetuResult<Vec<ConsensusFrame>> {
+            Ok(Vec::new())
+        }
+        async fn highest_finalized_depth(&self) -> SetuResult<u64> {
+            Ok(0)
+        }
     }
 
     /// Helper: build a finalized CF with a single-validator quorum (validator

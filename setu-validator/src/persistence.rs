@@ -403,6 +403,16 @@ mod tests {
         async fn pending_count(&self) -> usize {
             0
         }
+        async fn get_finalized_after_depth(
+            &self,
+            _after_depth: u64,
+            _limit: usize,
+        ) -> SetuResult<Vec<ConsensusFrame>> {
+            Ok(Vec::new())
+        }
+        async fn highest_finalized_depth(&self) -> SetuResult<u64> {
+            Ok(0)
+        }
     }
 
     /// Mirror of `persist_pending_finalized_cfs` body with an explicit
