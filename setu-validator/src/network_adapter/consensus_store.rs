@@ -6,20 +6,27 @@
 use crate::protocol::SerializedEvent;
 use super::setu_handler::MessageHandlerStore;
 use consensus::ConsensusEngine;
-use setu_storage::EventStoreBackend;
+use setu_storage::{CFStoreBackend, EventStoreBackend};
+use setu_types::ConsensusFrame;
 use std::sync::Arc;
 use tracing::warn;
 
-/// Wraps ConsensusEngine + EventStoreBackend as MessageHandlerStore
+/// Wraps ConsensusEngine + EventStoreBackend + CFStoreBackend as MessageHandlerStore
 pub struct ConsensusEngineStore {
     engine: Arc<ConsensusEngine>,
     /// Direct storage backend — bypasses receive_event_from_network to avoid side effects
     event_store: Arc<dyn EventStoreBackend>,
+    /// CF storage backend — exposes finalized CF reads for v3 catch-up
+    cf_store: Arc<dyn CFStoreBackend>,
 }
 
 impl ConsensusEngineStore {
-    pub fn new(engine: Arc<ConsensusEngine>, event_store: Arc<dyn EventStoreBackend>) -> Self {
-        Self { engine, event_store }
+    pub fn new(
+        engine: Arc<ConsensusEngine>,
+        event_store: Arc<dyn EventStoreBackend>,
+        cf_store: Arc<dyn CFStoreBackend>,
+    ) -> Self {
+        Self { engine, event_store, cf_store }
     }
 }
 
@@ -48,5 +55,23 @@ impl MessageHandlerStore for ConsensusEngineStore {
             }
         }
         Ok(())
+    }
+
+    async fn get_finalized_cfs_after_depth(
+        &self,
+        after_depth: u64,
+        limit: u32,
+    ) -> Result<(Vec<ConsensusFrame>, u64), String> {
+        let cfs = self
+            .cf_store
+            .get_finalized_after_depth(after_depth, limit as usize)
+            .await
+            .map_err(|e| format!("get_finalized_after_depth: {:?}", e))?;
+        let highest = self
+            .cf_store
+            .highest_finalized_depth()
+            .await
+            .map_err(|e| format!("highest_finalized_depth: {:?}", e))?;
+        Ok((cfs, highest))
     }
 }

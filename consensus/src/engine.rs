@@ -70,6 +70,35 @@ pub enum ConsensusMessage {
     LeaderChanged { round: Round, new_leader: String },
 }
 
+/// Outcome of [`ConsensusEngine::receive_cf`] processing.
+///
+/// PR-4 introduces explicit "soft outcomes" for the two round-drift cases that
+/// were previously rejected as errors:
+///
+/// * `Accepted` — happy path; equivalent to the legacy `(bool, Option<Anchor>)`
+///   return tuple.
+/// * `NeedsCatchUp` — the CF carries a round strictly greater than our local
+///   round, which is a normal transient condition while we are catching up.
+///   The caller is expected to run startup-style catch-up to `up_to_depth`
+///   and then re-enqueue `cf` exactly once.
+/// * `Stale` — the CF carries a round strictly less than our local round; it
+///   is no longer relevant. Drop silently.
+#[derive(Debug, Clone)]
+pub enum CfReceiveOutcome {
+    Accepted {
+        finalized: bool,
+        anchor: Option<setu_types::Anchor>,
+    },
+    NeedsCatchUp {
+        up_to_depth: u64,
+        cf: ConsensusFrame,
+    },
+    Stale {
+        cf_round: u64,
+        local_round: u64,
+    },
+}
+
 /// The main consensus engine
 pub struct ConsensusEngine {
     /// Configuration
@@ -730,7 +759,7 @@ impl ConsensusEngine {
 
     /// Try to create a ConsensusFrame if conditions are met
     async fn try_create_cf(&self) -> SetuResult<Option<ConsensusFrame>> {
-        let _current_round = {
+        let current_round = {
             let validator_set = self.validator_set.read().await;
             let round = validator_set.current_round();
 
@@ -771,7 +800,7 @@ impl ConsensusEngine {
 
         let dag = self.dag.read().await;
         // AnchorBuilder now handles all Merkle tree computation internally
-        let cf = manager.try_create_cf(&dag, &vlc);
+        let cf = manager.try_create_cf(&dag, &vlc, current_round);
         drop(dag);
 
         if let Some(ref frame) = cf {
@@ -906,13 +935,18 @@ impl ConsensusEngine {
     /// 7. Vote for the CF
     /// 8. Check if our vote causes finalization
     ///
-    /// Returns (finalized, Option<Anchor>) so the caller can persist when finalized.
-    /// This ensures followers have consistent state with the leader.
+    /// Returns [`CfReceiveOutcome`]. PR-4 v3 replaced the legacy
+    /// `(bool, Option<Anchor>)` tuple with explicit Accepted / NeedsCatchUp /
+    /// Stale variants so round drift on a still-running validator does not
+    /// reject the CF as an error.
     pub async fn receive_cf(
         &self,
         mut cf: ConsensusFrame,
-    ) -> SetuResult<(bool, Option<setu_types::Anchor>)> {
-        // Step 0: Verify CF ID matches content (anti-tampering)
+    ) -> SetuResult<CfReceiveOutcome> {
+        // Step 0: Verify CF ID matches content (anti-tampering). With PR-4
+        // V2 domain separator this implicitly binds `cf.round` to
+        // `cf.proposer`, so a forged CF re-using an old proposer at a
+        // different round will fail here.
         if !cf.verify_id() {
             return Err(setu_types::SetuError::InvalidData(format!(
                 "CF ID verification failed - possible tampering: {}",
@@ -920,16 +954,46 @@ impl ConsensusEngine {
             )));
         }
 
-        // Step 1: Verify proposer is valid for current round
-        // This prevents malicious nodes from creating fake CFs
+        // Step 1: Proposer must be the rotation-elected proposer for the round
+        // carried by the CF itself (not the local round). This makes the check
+        // tolerant to transient round drift while still rejecting forged CFs
+        // whose proposer does not match the rotation at the claimed round.
         {
             let validator_set = self.validator_set.read().await;
-            let current_round = validator_set.current_round();
-            if !validator_set.is_valid_proposer(&cf.proposer, current_round) {
+            if !validator_set.is_valid_proposer(&cf.proposer, cf.round) {
                 return Err(setu_types::SetuError::InvalidData(format!(
                     "CF proposer {} is not valid for round {}",
-                    cf.proposer, current_round
+                    cf.proposer, cf.round
                 )));
+            }
+        }
+
+        // Step 1.b: Round drift handling. A CF that runs ahead of us is a
+        // catch-up signal; a CF that runs behind us is stale.
+        {
+            let local_round = self.validator_set.read().await.current_round();
+            if cf.round > local_round {
+                let up_to_depth = cf.anchor.depth.saturating_sub(1);
+                debug!(
+                    cf_id = %cf.id,
+                    cf_round = cf.round,
+                    local_round,
+                    up_to_depth,
+                    "receive_cf: cf.round > local_round, requesting catch-up"
+                );
+                return Ok(CfReceiveOutcome::NeedsCatchUp { up_to_depth, cf });
+            }
+            if cf.round < local_round {
+                debug!(
+                    cf_id = %cf.id,
+                    cf_round = cf.round,
+                    local_round,
+                    "receive_cf: dropping stale CF"
+                );
+                return Ok(CfReceiveOutcome::Stale {
+                    cf_round: cf.round,
+                    local_round,
+                });
             }
         }
 
@@ -963,7 +1027,7 @@ impl ConsensusEngine {
         {
             let manager = self.consensus_manager.read().await;
             if manager.has_cf(&cf.id) {
-                return Ok((false, None));
+                return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
             }
         }
 
@@ -983,7 +1047,7 @@ impl ConsensusEngine {
 
         // Double-check idempotency (another thread may have processed while we fetched)
         if manager.has_cf(&cf.id) {
-            return Ok((false, None));
+            return Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None });
         }
 
         // Step 4: Verify the CF's merkle roots are internally consistent
@@ -1032,11 +1096,12 @@ impl ConsensusEngine {
                 warn!(cf_id = %cf_id, ?failure, "CF dropped on apply failure (receive_cf path)");
             }
             if matches!(outcome, CfLifecycleOutcome::Finalized { .. }) {
-                return self.handle_finalization(&mut manager).await;
+                let (finalized, anchor) = self.handle_finalization(&mut manager).await?;
+                return Ok(CfReceiveOutcome::Accepted { finalized, anchor });
             }
         }
 
-        Ok((false, None))
+        Ok(CfReceiveOutcome::Accepted { finalized: false, anchor: None })
     }
 
     pub async fn receive_finalized_cf(
@@ -1563,19 +1628,20 @@ impl ConsensusEngine {
         heartbeat_interval: Duration,
     ) -> SetuResult<Option<ConsensusFrame>> {
         // Leader check
-        {
+        let current_round = {
             let validator_set = self.validator_set.read().await;
             let round = validator_set.current_round();
             if !validator_set.is_valid_proposer(&self.local_validator_id, round) {
                 return Ok(None);
             }
-        }
+            round
+        };
 
         let vlc = self.vlc.read().await;
         let mut manager = self.consensus_manager.write().await;
         let dag = self.dag.read().await;
 
-        let cf = manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval);
+        let cf = manager.try_create_cf_heartbeat(&dag, &vlc, heartbeat_interval, current_round);
         drop(dag);
 
         if let Some(ref frame) = cf {
@@ -1888,7 +1954,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
@@ -1930,7 +1996,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v2".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v2".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
@@ -1969,7 +2035,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
@@ -2024,8 +2090,8 @@ mod tests {
             Some(anchor1.id.clone()),
             1,
         );
-        let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
-        let cf2 = ConsensusFrame::new(anchor2.clone(), "v1".to_string());
+        let cf1 = ConsensusFrame::new(0, anchor1.clone(), "v1".to_string());
+        let cf2 = ConsensusFrame::new(0, anchor2.clone(), "v1".to_string());
         {
             let mut q = engine.pending_completions.lock().await;
             q.push(CompletionEntry {
@@ -2081,7 +2147,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
@@ -2128,7 +2194,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true).with_signature(vec![7; 64]));
 
@@ -2156,7 +2222,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));
@@ -2186,7 +2252,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "v1".to_string());
         cf.created_at = 0;
         let cf_id = cf.id.clone();
 
@@ -2301,7 +2367,10 @@ mod tests {
             "receive_cf must not self-deadlock when buffered votes make it finalize"
         );
 
-        let (finalized, anchor) = result.unwrap().unwrap();
+        let (finalized, anchor) = match result.unwrap().unwrap() {
+            CfReceiveOutcome::Accepted { finalized, anchor } => (finalized, anchor),
+            other => panic!("expected Accepted outcome, got {:?}", other),
+        };
         assert!(
             finalized,
             "buffered vote + leader vote + local vote should finalize"
@@ -2384,7 +2453,7 @@ mod tests {
             0,
         );
 
-        let cf_correct = ConsensusFrame::new(anchor_correct, "v1".to_string());
+        let cf_correct = ConsensusFrame::new(0, anchor_correct, "v1".to_string());
 
         // This should succeed (anchor_chain_root matches)
         let result = engine.receive_cf(cf_correct).await;
@@ -2418,7 +2487,7 @@ mod tests {
             0,
         );
 
-        let cf_wrong = ConsensusFrame::new(anchor_wrong, "v1".to_string());
+        let cf_wrong = ConsensusFrame::new(0, anchor_wrong, "v1".to_string());
 
         // This should FAIL due to anchor chain root mismatch
         let result = engine.receive_cf(cf_wrong).await;
@@ -2507,7 +2576,7 @@ mod tests {
             0,
         );
 
-        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor.clone(), "v1".to_string());
 
         {
             let mut manager = follower_engine.consensus_manager.write().await;
@@ -2584,7 +2653,7 @@ mod tests {
             0,
         );
 
-        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
 
         let mut manager = engine.consensus_manager.write().await;
@@ -2647,7 +2716,7 @@ mod tests {
             0,
         );
 
-        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
 
         {
@@ -2701,7 +2770,7 @@ mod tests {
             0,
         );
 
-        let cf = ConsensusFrame::new(anchor.clone(), "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor.clone(), "v1".to_string());
         let cf_id = cf.id.clone();
 
         let mut manager = engine.consensus_manager.write().await;
@@ -2755,7 +2824,7 @@ mod tests {
             0,
         );
 
-        let cf1 = ConsensusFrame::new(anchor1.clone(), "v1".to_string());
+        let cf1 = ConsensusFrame::new(0, anchor1.clone(), "v1".to_string());
         let cf1_id = cf1.id.clone();
 
         let mut manager = engine.consensus_manager.write().await;
@@ -2815,7 +2884,7 @@ mod tests {
             None,
             0,
         );
-        let cf = ConsensusFrame::new(anchor, "v1".to_string());
+        let cf = ConsensusFrame::new(0, anchor, "v1".to_string());
 
         {
             let mut manager = engine.consensus_manager.write().await;

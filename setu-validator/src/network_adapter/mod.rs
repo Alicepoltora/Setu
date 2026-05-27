@@ -50,10 +50,12 @@
 mod consensus_store;
 mod router;
 mod setu_handler;
+mod state_sync_client;
 mod sync_protocol;
 
 pub use consensus_store::ConsensusEngineStore;
 pub use router::{MessageRouter, NetworkEventHandler};
 pub use setu_handler::{SetuMessageHandler, MessageHandlerStore, SETU_ROUTE};
+pub use state_sync_client::{StateSyncClient, SyncError};
 pub use sync_protocol::{SyncProtocol, SyncStore, InMemorySyncStore};
 

@@ -2023,7 +2023,7 @@ mod tests {
             None,
             depth,
         );
-        ConsensusFrame::new(anchor, "v1".to_string())
+        ConsensusFrame::new(0, anchor, "v1".to_string())
     }
 
     /// T1: RootMismatch on follower path clears overlay.

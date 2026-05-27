@@ -8,7 +8,7 @@ use crate::protocol::{NetworkEvent, SetuMessage, SerializedEvent};
 use async_trait::async_trait;
 use bytes::Bytes;
 use setu_network_anemo::{GenericMessageHandler, HandleResult, HandlerError};
-use setu_types::Event;
+use setu_types::{ConsensusFrame, Event};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -55,6 +55,16 @@ pub trait MessageHandlerStore: Send + Sync + 'static {
     
     /// Store events
     async fn store_events(&self, events: Vec<SerializedEvent>) -> Result<(), String>;
+
+    /// v3 catch-up: return finalized CFs with `anchor.depth > after_depth`,
+    /// sorted ascending by depth, capped at `limit`.
+    /// Also returns the responder's `highest_finalized_depth` so the caller
+    /// can detect end-of-stream without an extra round-trip.
+    async fn get_finalized_cfs_after_depth(
+        &self,
+        after_depth: u64,
+        limit: u32,
+    ) -> Result<(Vec<ConsensusFrame>, u64), String>;
 }
 
 /// Setu protocol message handler
@@ -120,6 +130,42 @@ where
             SetuMessage::Ping { timestamp, nonce } => {
                 debug!("Processing Ping request");
                 Ok(Some(SetuMessage::Pong { timestamp, nonce }))
+            }
+
+            SetuMessage::RequestFinalizedCFs { after_depth, limit, requester_id } => {
+                // Cap limit defensively at MAX_BATCH; storage layer also enforces its own bounds.
+                const MAX_BATCH: u32 = 64;
+                let effective_limit = limit.min(MAX_BATCH);
+                debug!(
+                    "Processing RequestFinalizedCFs from {}: after_depth={}, limit={} (effective {})",
+                    requester_id, after_depth, limit, effective_limit
+                );
+                match self
+                    .store
+                    .get_finalized_cfs_after_depth(after_depth, effective_limit)
+                    .await
+                {
+                    Ok((cfs, highest_finalized_depth)) => {
+                        debug!(
+                            "Returning {} finalized CFs (highest_depth={})",
+                            cfs.len(),
+                            highest_finalized_depth
+                        );
+                        Ok(Some(SetuMessage::FinalizedCFsResponse {
+                            cfs,
+                            highest_finalized_depth,
+                            responder_id: self.local_node_id.clone(),
+                        }))
+                    }
+                    Err(e) => {
+                        warn!("Failed to query finalized CFs: {}", e);
+                        Ok(Some(SetuMessage::FinalizedCFsResponse {
+                            cfs: Vec::new(),
+                            highest_finalized_depth: 0,
+                            responder_id: self.local_node_id.clone(),
+                        }))
+                    }
+                }
             }
             
             SetuMessage::EventBroadcast { event, sender_id } => {
@@ -205,7 +251,9 @@ where
             }
             
             // Response messages should not be received as requests
-            SetuMessage::EventsResponse { .. } | SetuMessage::Pong { .. } => {
+            SetuMessage::EventsResponse { .. }
+            | SetuMessage::Pong { .. }
+            | SetuMessage::FinalizedCFsResponse { .. } => {
                 warn!("Received response message as request - ignoring");
                 Ok(None)
             }
@@ -256,17 +304,23 @@ mod tests {
     /// Mock store for testing
     struct MockStore {
         events: RwLock<HashMap<String, SerializedEvent>>,
+        finalized_cfs: RwLock<Vec<ConsensusFrame>>,
     }
     
     impl MockStore {
         fn new() -> Self {
             Self {
                 events: RwLock::new(HashMap::new()),
+                finalized_cfs: RwLock::new(Vec::new()),
             }
         }
         
         async fn add_event(&self, event: SerializedEvent) {
             self.events.write().await.insert(event.id.clone(), event);
+        }
+
+        async fn add_finalized_cf(&self, cf: ConsensusFrame) {
+            self.finalized_cfs.write().await.push(cf);
         }
     }
     
@@ -286,6 +340,23 @@ mod tests {
                 store.insert(event.id.clone(), event);
             }
             Ok(())
+        }
+
+        async fn get_finalized_cfs_after_depth(
+            &self,
+            after_depth: u64,
+            limit: u32,
+        ) -> Result<(Vec<ConsensusFrame>, u64), String> {
+            let cfs = self.finalized_cfs.read().await;
+            let mut matching: Vec<ConsensusFrame> = cfs
+                .iter()
+                .filter(|cf| cf.anchor.depth > after_depth)
+                .cloned()
+                .collect();
+            matching.sort_by_key(|cf| cf.anchor.depth);
+            matching.truncate(limit as usize);
+            let highest = cfs.iter().map(|cf| cf.anchor.depth).max().unwrap_or(0);
+            Ok((matching, highest))
         }
     }
     
@@ -374,6 +445,138 @@ mod tests {
                 assert_eq!(events[0].id, event_id);
             }
             _ => panic!("Expected EventsResponse"),
+        }
+    }
+
+    // ---- v3 RequestFinalizedCFs tests ------------------------------------
+
+    fn make_cf_with_depth(depth: u64) -> ConsensusFrame {
+        let anchor = setu_types::Anchor::new(
+            Vec::new(),
+            VLCSnapshot::default(),
+            format!("state-{}", depth),
+            None,
+            depth,
+        );
+        ConsensusFrame::new(0, anchor, "proposer".to_string())
+    }
+
+    async fn make_handler_with_cfs(depths: &[u64]) -> (Arc<MockStore>, SetuMessageHandler<MockStore>) {
+        let store = Arc::new(MockStore::new());
+        for d in depths {
+            store.add_finalized_cf(make_cf_with_depth(*d)).await;
+        }
+        let (event_tx, _rx) = mpsc::channel(8);
+        let handler = SetuMessageHandler::new(Arc::clone(&store), "node-a".to_string(), event_tx);
+        (store, handler)
+    }
+
+    async fn dispatch(handler: &SetuMessageHandler<MockStore>, msg: SetuMessage) -> Option<SetuMessage> {
+        let bytes = Bytes::from(bincode::serialize(&msg).unwrap());
+        let resp = handler.handle(SETU_ROUTE, bytes).await.unwrap();
+        resp.map(|b| bincode::deserialize::<SetuMessage>(&b).unwrap())
+    }
+
+    #[tokio::test]
+    async fn request_finalized_cfs_returns_after_depth() {
+        let (_store, handler) = make_handler_with_cfs(&[1, 3, 5, 7, 9]).await;
+        let resp = dispatch(&handler, SetuMessage::RequestFinalizedCFs {
+            after_depth: 4,
+            limit: 10,
+            requester_id: "b".to_string(),
+        }).await.expect("response");
+        match resp {
+            SetuMessage::FinalizedCFsResponse { cfs, highest_finalized_depth, responder_id } => {
+                assert_eq!(responder_id, "node-a");
+                assert_eq!(highest_finalized_depth, 9);
+                let depths: Vec<u64> = cfs.iter().map(|c| c.anchor.depth).collect();
+                assert_eq!(depths, vec![5, 7, 9]);
+            }
+            other => panic!("expected FinalizedCFsResponse, got {:?}", other.message_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_finalized_cfs_respects_limit() {
+        let depths: Vec<u64> = (1..=100).collect();
+        let (_, handler) = make_handler_with_cfs(&depths).await;
+        let resp = dispatch(&handler, SetuMessage::RequestFinalizedCFs {
+            after_depth: 0,
+            limit: 10,
+            requester_id: "b".to_string(),
+        }).await.expect("response");
+        if let SetuMessage::FinalizedCFsResponse { cfs, .. } = resp {
+            assert_eq!(cfs.len(), 10);
+            // ascending and all > 0
+            for w in cfs.windows(2) {
+                assert!(w[0].anchor.depth < w[1].anchor.depth);
+            }
+            assert!(cfs.iter().all(|c| c.anchor.depth > 0));
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_finalized_cfs_caps_at_max_batch() {
+        let depths: Vec<u64> = (1..=200).collect();
+        let (_, handler) = make_handler_with_cfs(&depths).await;
+        let resp = dispatch(&handler, SetuMessage::RequestFinalizedCFs {
+            after_depth: 0,
+            limit: u32::MAX,
+            requester_id: "b".to_string(),
+        }).await.expect("response");
+        if let SetuMessage::FinalizedCFsResponse { cfs, .. } = resp {
+            assert_eq!(cfs.len(), 64, "MAX_BATCH should cap at 64");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_finalized_cfs_empty_store() {
+        let (_, handler) = make_handler_with_cfs(&[]).await;
+        let resp = dispatch(&handler, SetuMessage::RequestFinalizedCFs {
+            after_depth: 0,
+            limit: 10,
+            requester_id: "b".to_string(),
+        }).await.expect("response");
+        if let SetuMessage::FinalizedCFsResponse { cfs, highest_finalized_depth, .. } = resp {
+            assert!(cfs.is_empty());
+            assert_eq!(highest_finalized_depth, 0);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_cfs_response_as_request_ignored() {
+        let (_, handler) = make_handler_with_cfs(&[]).await;
+        let resp = dispatch(&handler, SetuMessage::FinalizedCFsResponse {
+            cfs: vec![],
+            highest_finalized_depth: 0,
+            responder_id: "x".to_string(),
+        }).await;
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_finalized_cfs_serialize_roundtrip() {
+        let cf = make_cf_with_depth(7);
+        let msg = SetuMessage::FinalizedCFsResponse {
+            cfs: vec![cf.clone()],
+            highest_finalized_depth: 7,
+            responder_id: "node-a".to_string(),
+        };
+        let bytes = bincode::serialize(&msg).unwrap();
+        let decoded: SetuMessage = bincode::deserialize(&bytes).unwrap();
+        if let SetuMessage::FinalizedCFsResponse { cfs, highest_finalized_depth, responder_id } = decoded {
+            assert_eq!(cfs.len(), 1);
+            assert_eq!(cfs[0].anchor.depth, 7);
+            assert_eq!(highest_finalized_depth, 7);
+            assert_eq!(responder_id, "node-a");
+        } else {
+            panic!("wrong variant");
         }
     }
 }

@@ -46,6 +46,7 @@ pub mod coin_reservation;
 pub mod dag_replay;
 pub mod governance;
 pub mod outcome_sink;
+pub mod startup_catchup;
 
 pub use router_manager::{RouterManager, RouterError, SolverConnection};
 pub use network::{

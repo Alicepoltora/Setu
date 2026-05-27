@@ -340,7 +340,7 @@ mod tests {
             None,
             0,
         );
-        let cf = setu_types::ConsensusFrame::new(anchor, "validator-1".to_string());
+        let cf = setu_types::ConsensusFrame::new(0, anchor, "validator-1".to_string());
         
         let result = broadcaster.broadcast_cf(&cf).await.unwrap();
         assert_eq!(result.success_count, 3);

@@ -3,12 +3,14 @@
 //! Routes incoming network events to appropriate handlers in the consensus layer.
 //! Events and CFs are stored in-memory (DAG) until finalized, then persisted.
 
-use consensus::ConsensusEngine;
+use consensus::{CfReceiveOutcome, ConsensusEngine};
 use crate::protocol::NetworkEvent;
 use setu_storage::{AnchorStoreBackend, CFStoreBackend, EventStoreBackend};
 use setu_types::{ConsensusFrame, Event, Vote};
 use crate::persistence::FinalizationPersister;
+use crate::network_adapter::StateSyncClient;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -58,7 +60,15 @@ pub struct MessageRouter {
     /// Per-CF index-persistence retry counter (Layer D, retry-then-escalate).
     /// Initialized empty; entries are added on failure and removed on success.
     cf_index_retries: Arc<parking_lot::Mutex<std::collections::HashMap<setu_types::CFId, u32>>>,
-
+    /// PR-4: optional state-sync client used when `receive_cf` returns
+    /// `NeedsCatchUp`. `None` when the validator is single-node or running in
+    /// a test harness without a peer mesh; the catch-up branch becomes a no-op
+    /// warn in that case.
+    state_sync_client: Option<Arc<StateSyncClient>>,
+    /// PR-4: serializes concurrent catch-up attempts. At most one catch-up runs
+    /// at a time per router; overlapping CFs that trigger NeedsCatchUp while a
+    /// catch-up is in flight are dropped (peer will rebroadcast).
+    catch_up_in_progress: Arc<AtomicBool>,
 }
 
 impl MessageRouter {
@@ -75,7 +85,16 @@ impl MessageRouter {
             anchor_store,
             cf_store,
             cf_index_retries: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            state_sync_client: None,
+            catch_up_in_progress: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// PR-4: attach an optional state-sync client so that `receive_cf` results
+    /// with [`CfReceiveOutcome::NeedsCatchUp`] can trigger an in-place catch-up.
+    pub fn with_state_sync_client(mut self, client: Arc<StateSyncClient>) -> Self {
+        self.state_sync_client = Some(client);
+        self
     }
     
     /// Start the message router event loop
@@ -121,6 +140,78 @@ impl MessageRouter {
                 self.handle_peer_disconnected(peer_id).await;
             }
         }
+    }
+
+    /// PR-4: in-place catch-up triggered when [`receive_cf`] reports
+    /// `NeedsCatchUp`. Spawns a background task that runs the same
+    /// `run_startup_catch_up` loop as PR-3 startup, then releases the guard.
+    /// Concurrent triggers (overlapping NeedsCatchUp from multiple peers) are
+    /// coalesced via [`AtomicBool`] CAS — the loser drops; the leader's
+    /// catch-up pass covers the gap on its behalf.
+    ///
+    /// The original CF is intentionally not re-enqueued: the leader's
+    /// heartbeat or next-round proposal will deliver a fresh CF whose round
+    /// matches the post-catch-up local view.
+    async fn trigger_catch_up_for_cf(&self, cf: ConsensusFrame, up_to_depth: u64) {
+        let client = match &self.state_sync_client {
+            Some(c) => c.clone(),
+            None => {
+                warn!(
+                    cf_id = %cf.id,
+                    cf_round = cf.round,
+                    up_to_depth,
+                    "NeedsCatchUp returned but no state_sync_client wired; dropping CF"
+                );
+                return;
+            }
+        };
+
+        if self
+            .catch_up_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            debug!(
+                cf_id = %cf.id,
+                cf_round = cf.round,
+                "catch-up already in progress; dropping NeedsCatchUp trigger"
+            );
+            return;
+        }
+
+        info!(
+            cf_id = %cf.id,
+            cf_round = cf.round,
+            up_to_depth,
+            "Triggering in-place catch-up after NeedsCatchUp outcome"
+        );
+
+        let engine = self.engine.clone();
+        let cf_store = self.cf_store.clone();
+        let flag = self.catch_up_in_progress.clone();
+
+        tokio::spawn(async move {
+            let source = crate::startup_catchup::StateSyncCatchUpSource::new(
+                client.as_ref().clone(),
+            );
+            let applier = crate::startup_catchup::EngineCatchUpApplier { engine, cf_store };
+            let config = crate::startup_catchup::CatchUpConfig::default();
+            match crate::startup_catchup::run_startup_catch_up(&source, &applier, config).await {
+                Ok(stats) => {
+                    info!(
+                        cfs_applied = stats.cfs_applied,
+                        final_depth = stats.final_depth,
+                        peer_highest = stats.peer_highest_seen,
+                        elapsed_ms = stats.elapsed.as_millis() as u64,
+                        "in-place catch-up completed"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "in-place catch-up failed");
+                }
+            }
+            flag.store(false, Ordering::Release);
+        });
     }
 }
 
@@ -254,7 +345,7 @@ impl NetworkEventHandler for MessageRouter {
         
         let cf_id = cf.id.clone();
         match self.engine.receive_cf(cf).await {
-            Ok((finalized, anchor)) => {
+            Ok(CfReceiveOutcome::Accepted { finalized, anchor }) => {
                 if finalized {
                     info!(
                         cf_id = %cf_id,
@@ -282,6 +373,17 @@ impl NetworkEventHandler for MessageRouter {
                 } else {
                     debug!(cf_id = %cf_id, "CF proposal processed, awaiting votes");
                 }
+            }
+            Ok(CfReceiveOutcome::NeedsCatchUp { up_to_depth, cf }) => {
+                self.trigger_catch_up_for_cf(cf, up_to_depth).await;
+            }
+            Ok(CfReceiveOutcome::Stale { cf_round, local_round }) => {
+                debug!(
+                    cf_id = %cf_id,
+                    cf_round,
+                    local_round,
+                    "Dropping stale CF proposal (round behind local)"
+                );
             }
             Err(e) => {
                 warn!(

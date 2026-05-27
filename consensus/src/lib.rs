@@ -61,7 +61,7 @@ pub use dag_manager::{
     DagManager, DagManagerConfig, DagManagerError,
     ParentInfo, ResolvedParents, GcStats, WarmupStats, DagStatsSnapshot,
 };
-pub use engine::{ConsensusEngine, ConsensusMessage, DagStats};
+pub use engine::{CfReceiveOutcome, ConsensusEngine, ConsensusMessage, DagStats};
 pub use folder::{ConsensusManager, DagFolder};
 pub use merkle_integration::{
     compute_events_root, compute_anchor_chain_root, compute_global_state_root,

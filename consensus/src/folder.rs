@@ -286,6 +286,7 @@ impl ConsensusManager {
         &mut self,
         dag: &Dag,
         vlc: &VLC,
+        round: u64,
     ) -> Option<ConsensusFrame> {
         // BUG-010 Step 2: enforce one open pending_build per local proposer.
         // current_round only advances after the local proposer's own CF finalizes,
@@ -307,7 +308,7 @@ impl ConsensusManager {
         self.trace_prepare_build_entry("normal", dag);
         // Use AnchorBuilder.prepare_build (deferred commit mode)
         match self.anchor_builder.prepare_build(dag, vlc, &in_flight) {
-            Ok(pending_build) => self.finalize_pending_build(pending_build),
+            Ok(pending_build) => self.finalize_pending_build(pending_build, round),
             Err(AnchorBuildError::DeltaNotReached { required, current }) => {
                 tracing::debug!(required, current, "CF not created: DeltaNotReached");
                 None
@@ -329,14 +330,15 @@ impl ConsensusManager {
     }
 
     /// Common post-build logic: create CF from anchor, store pending_build.
-    fn finalize_pending_build(&mut self, pending_build: PendingAnchorBuild) -> Option<ConsensusFrame> {
+    fn finalize_pending_build(&mut self, pending_build: PendingAnchorBuild, round: u64) -> Option<ConsensusFrame> {
         let anchor = pending_build.anchor.clone();
         tracing::info!(
             anchor_id = %anchor.id,
             event_count = anchor.event_ids.len(),
+            round,
             "CF created with anchor"
         );
-        let cf = ConsensusFrame::new(anchor, self.local_validator_id.clone());
+        let cf = ConsensusFrame::new(round, anchor, self.local_validator_id.clone());
         self.pending_builds.insert(cf.id.clone(), pending_build);
         self.pending_cfs.insert(cf.id.clone(), cf.clone());
         Some(cf)
@@ -349,6 +351,7 @@ impl ConsensusManager {
         dag: &Dag,
         vlc: &VLC,
         heartbeat_interval: std::time::Duration,
+        round: u64,
     ) -> Option<ConsensusFrame> {
         // BUG-010 follow-up: heartbeat must obey the same Step 2 invariant as
         // the normal path. Without this guard the 5s heartbeat tick could open
@@ -366,7 +369,7 @@ impl ConsensusManager {
         self.trace_prepare_build_entry("heartbeat", dag);
         let in_flight = self.collect_in_flight_event_ids();
         match self.anchor_builder.prepare_build_heartbeat(dag, vlc, heartbeat_interval, &in_flight) {
-            Ok(pending_build) => self.finalize_pending_build(pending_build),
+            Ok(pending_build) => self.finalize_pending_build(pending_build, round),
             Err(_) => None,
         }
     }
@@ -1034,7 +1037,7 @@ mod tests {
         let (dag, vlc) = setup_dag_with_events(10);
 
         // New API: try_create_cf without external state_root
-        let cf = manager.try_create_cf(&dag, &vlc);
+        let cf = manager.try_create_cf(&dag, &vlc, 0);
         assert!(cf.is_some());
         
         // Verify anchor has merkle_roots
@@ -1054,7 +1057,7 @@ mod tests {
         let (dag, vlc) = setup_dag_with_events(10);
 
         // Create CF (deferred commit mode - state not modified yet)
-        let cf = manager.try_create_cf(&dag, &vlc);
+        let cf = manager.try_create_cf(&dag, &vlc, 0);
         assert!(cf.is_some());
         let cf_id = cf.unwrap().id.clone();
         
@@ -1090,7 +1093,7 @@ mod tests {
             None,
             0,
         );
-        let mut pending_cf = ConsensusFrame::new(anchor, "validator1".to_string());
+        let mut pending_cf = ConsensusFrame::new(0, anchor, "validator1".to_string());
         let cf_id = pending_cf.id.clone();
         pending_cf.add_vote(Vote::new("validator1".to_string(), cf_id.clone(), true));
         manager.receive_cf(pending_cf.clone());
@@ -1124,12 +1127,12 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let first = manager.try_create_cf(&dag, &vlc);
+        let first = manager.try_create_cf(&dag, &vlc, 0);
         assert!(first.is_some(), "first try_create_cf should produce a CF");
 
         // Second call must be skipped by the Step 2 guard because the first
         // CF's pending_build is still open (not yet finalized).
-        let second = manager.try_create_cf(&dag, &vlc);
+        let second = manager.try_create_cf(&dag, &vlc, 0);
         assert!(
             second.is_none(),
             "second try_create_cf must return None while pending_build is open"
@@ -1152,7 +1155,7 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let cf = manager.try_create_cf(&dag, &vlc).expect("first CF");
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("first CF");
         let cf_id = cf.id.clone();
         assert_eq!(
             manager.pending_builds_len_for_testing(),
@@ -1211,7 +1214,7 @@ mod tests {
             None,
             0,
         );
-        let cf = ConsensusFrame::new(anchor, "v2".to_string());
+        let cf = ConsensusFrame::new(0, anchor, "v2".to_string());
         let cf_id = cf.id.clone();
 
         // Receive the CF and inject its events into pending_cf_events so the
@@ -1267,7 +1270,7 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let cf = manager.try_create_cf(&dag, &vlc).expect("CF");
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("CF");
         let cf_id = cf.id.clone();
         manager.vote_for_cf(&cf_id, true, None);
         assert!(manager.classify_finalization(&cf_id).is_finalized());
@@ -1296,12 +1299,12 @@ mod tests {
         let (dag, vlc) = setup_dag_with_events(10);
 
         // Open a normal-path build; it does not finalize because quorum needs 3.
-        let cf = manager.try_create_cf(&dag, &vlc).expect("normal CF");
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("normal CF");
         let cf_id = cf.id.clone();
         assert_eq!(manager.pending_builds_len_for_testing(), 1);
 
         // Heartbeat must be suppressed while pending_build is open.
-        let hb = manager.try_create_cf_heartbeat(&dag, &vlc, std::time::Duration::from_millis(0));
+        let hb = manager.try_create_cf_heartbeat(&dag, &vlc, std::time::Duration::from_millis(0), 0);
         assert!(hb.is_none(), "heartbeat must be blocked by open pending_build");
         assert_eq!(manager.pending_builds_len_for_testing(), 1);
 
@@ -1334,13 +1337,13 @@ mod tests {
 
         // Heartbeat with zero interval => immediate fire.
         let hb = manager
-            .try_create_cf_heartbeat(&dag, &vlc, std::time::Duration::from_millis(0))
+            .try_create_cf_heartbeat(&dag, &vlc, std::time::Duration::from_millis(0), 0)
             .expect("heartbeat CF");
         let _ = hb.id;
         assert_eq!(manager.pending_builds_len_for_testing(), 1);
 
         // Normal path must be blocked by the open heartbeat pending_build.
-        let normal = manager.try_create_cf(&dag, &vlc);
+        let normal = manager.try_create_cf(&dag, &vlc, 0);
         assert!(
             normal.is_none(),
             "normal try_create_cf must be blocked by open heartbeat pending_build"
@@ -1372,7 +1375,7 @@ mod tests {
             subnet_roots: Default::default(),
         };
         let anchor = Anchor::with_merkle_roots(event_ids, vlc.snapshot(), bad_roots, None, 0);
-        let cf = ConsensusFrame::new(anchor, "v2".to_string());
+        let cf = ConsensusFrame::new(0, anchor, "v2".to_string());
         let cf_id = cf.id.clone();
         manager.receive_cf(cf.clone());
         assert!(manager.apply_cf_state_changes(&dag, &cf));
@@ -1410,7 +1413,7 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let cf = manager.try_create_cf(&dag, &vlc).expect("CF");
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("CF");
         let cf_id = cf.id.clone();
         assert_eq!(manager.pending_builds_len_for_testing(), 1);
 
@@ -1443,11 +1446,11 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let _cf = manager.try_create_cf(&dag, &vlc).expect("CF");
+        let _cf = manager.try_create_cf(&dag, &vlc, 0).expect("CF");
         assert_eq!(manager.pending_builds_len_for_testing(), 1);
 
         // try_create_cf is blocked.
-        let blocked = manager.try_create_cf(&dag, &vlc);
+        let blocked = manager.try_create_cf(&dag, &vlc, 0);
         assert!(blocked.is_none(), "second build must be blocked by Step 2 guard");
 
         std::thread::sleep(std::time::Duration::from_millis(80));
@@ -1472,7 +1475,7 @@ mod tests {
         let mut manager = ConsensusManager::new(config, "v1".to_string());
         let (dag, vlc) = setup_dag_with_events(10);
 
-        let cf = manager.try_create_cf(&dag, &vlc).expect("CF");
+        let cf = manager.try_create_cf(&dag, &vlc, 0).expect("CF");
         let cf_id = cf.id.clone();
 
         // Inject a synthetic apply failure tied to this cf_id.

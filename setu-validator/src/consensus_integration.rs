@@ -671,8 +671,30 @@ impl ConsensusValidator {
         );
         
         // Verify, process, and vote for the CF
-        // Returns (finalized, anchor) if our vote causes finalization
-        let (finalized, anchor) = self.engine.receive_cf(cf).await?;
+        // Returns (finalized, anchor) if our vote causes finalization.
+        //
+        // PR-4: the engine now returns a richer `CfReceiveOutcome`. This
+        // wrapper keeps the legacy `(bool, Option<Anchor>)` shape for HTTP /
+        // RPC callers — they can't act on `NeedsCatchUp` here (no state-sync
+        // client wired) so non-Accepted variants become `(false, None)`. The
+        // network-event path uses `MessageRouter::handle_cf_proposal` which
+        // does react to `NeedsCatchUp`.
+        let (finalized, anchor) = match self.engine.receive_cf(cf).await? {
+            consensus::CfReceiveOutcome::Accepted { finalized, anchor } => (finalized, anchor),
+            consensus::CfReceiveOutcome::NeedsCatchUp { up_to_depth, cf } => {
+                warn!(
+                    cf_id = %cf.id,
+                    cf_round = cf.round,
+                    up_to_depth,
+                    "receive_cf (legacy wrapper): NeedsCatchUp ignored; rely on network router"
+                );
+                (false, None)
+            }
+            consensus::CfReceiveOutcome::Stale { cf_round, local_round } => {
+                debug!(cf_round, local_round, "receive_cf (legacy wrapper): stale CF dropped");
+                (false, None)
+            }
+        };
         
         if finalized {
             if let Some(ref a) = anchor {
@@ -1313,6 +1335,16 @@ mod tests {
         async fn latest_finalized(&self) -> Option<ConsensusFrame> { None }
         async fn finalized_count(&self) -> usize { 0 }
         async fn pending_count(&self) -> usize { 0 }
+        async fn get_finalized_after_depth(
+            &self,
+            _after_depth: u64,
+            _limit: usize,
+        ) -> SetuResult<Vec<ConsensusFrame>> {
+            Ok(Vec::new())
+        }
+        async fn highest_finalized_depth(&self) -> SetuResult<u64> {
+            Ok(0)
+        }
     }
 
     /// Helper: build a finalized CF with a single-validator quorum (validator
@@ -1326,7 +1358,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "test-validator".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "test-validator".to_string());
         cf.add_vote(Vote::new("test-validator".to_string(), cf.id.clone(), true));
         cf.finalize();
         cf
@@ -1342,7 +1374,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, leader.to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, leader.to_string());
         cf.add_vote(Vote::new("v1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v2".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("v3".to_string(), cf.id.clone(), true));

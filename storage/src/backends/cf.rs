@@ -44,6 +44,29 @@ pub trait CFStoreBackend: Send + Sync + Debug {
 
     /// Count pending CFs
     async fn pending_count(&self) -> usize;
+
+    // =========================================================================
+    // v3 bounded-read API (post-restart-finality-stall-v3)
+    // =========================================================================
+
+    /// Return finalized CFs with `anchor.depth > after_depth`, sorted
+    /// ascending by `anchor.depth`, capped at `limit`.
+    ///
+    /// Contract:
+    /// - Strict `>`, not `>=`: a caller passing its own `highest_finalized_depth()`
+    ///   does not receive the boundary item back.
+    /// - Returned `Vec` is sorted ascending by `anchor.depth`.
+    /// - `limit == 0` returns an empty `Vec`.
+    /// - Implementations MUST only return CFs whose `cf:{id}` blob and
+    ///   `finalized` index entry are both durably present.
+    async fn get_finalized_after_depth(
+        &self,
+        after_depth: u64,
+        limit: usize,
+    ) -> SetuResult<Vec<ConsensusFrame>>;
+
+    /// Highest `anchor.depth` among finalized CFs, or 0 if none.
+    async fn highest_finalized_depth(&self) -> SetuResult<u64>;
 }
 
 // ============================================================================
@@ -85,6 +108,18 @@ impl CFStoreBackend for CFStore {
     async fn pending_count(&self) -> usize {
         CFStore::pending_count(self).await
     }
+
+    async fn get_finalized_after_depth(
+        &self,
+        after_depth: u64,
+        limit: usize,
+    ) -> SetuResult<Vec<ConsensusFrame>> {
+        Ok(CFStore::get_finalized_after_depth(self, after_depth, limit).await)
+    }
+
+    async fn highest_finalized_depth(&self) -> SetuResult<u64> {
+        Ok(CFStore::highest_finalized_depth(self).await)
+    }
 }
 
 // ============================================================================
@@ -125,5 +160,17 @@ impl CFStoreBackend for RocksDBCFStore {
 
     async fn pending_count(&self) -> usize {
         RocksDBCFStore::pending_count(self).await
+    }
+
+    async fn get_finalized_after_depth(
+        &self,
+        after_depth: u64,
+        limit: usize,
+    ) -> SetuResult<Vec<ConsensusFrame>> {
+        RocksDBCFStore::get_finalized_after_depth(self, after_depth, limit).await
+    }
+
+    async fn highest_finalized_depth(&self) -> SetuResult<u64> {
+        RocksDBCFStore::highest_finalized_depth(self).await
     }
 }

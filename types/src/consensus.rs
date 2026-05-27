@@ -275,6 +275,10 @@ impl Vote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusFrame {
     pub id: CFId,
+    /// Consensus round at which this CF was proposed. Binds proposer identity
+    /// to the leader-rotation schedule so a forged CF carrying a stale
+    /// proposer cannot pass `verify_id` at a different round (PR-4 v3).
+    pub round: u64,
     pub anchor: Anchor,
     pub proposer: String,
     pub status: CFStatus,
@@ -284,16 +288,17 @@ pub struct ConsensusFrame {
 }
 
 impl ConsensusFrame {
-    pub fn new(anchor: Anchor, proposer: String) -> Self {
+    pub fn new(round: u64, anchor: Anchor, proposer: String) -> Self {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        let id = Self::compute_id(&anchor, &proposer, timestamp);
+        let id = Self::compute_id(round, &anchor, &proposer, timestamp);
 
         Self {
             id,
+            round,
             anchor,
             proposer,
             status: CFStatus::Proposed,
@@ -303,9 +308,11 @@ impl ConsensusFrame {
         }
     }
 
-    fn compute_id(anchor: &Anchor, proposer: &str, timestamp: u64) -> CFId {
+    fn compute_id(round: u64, anchor: &Anchor, proposer: &str, timestamp: u64) -> CFId {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"SETU_CF_ID:");
+        // V2 domain separator: includes round to bind proposer<->round (PR-4).
+        hasher.update(b"SETU_CF_ID_V2:");
+        hasher.update(&round.to_le_bytes());
         hasher.update(anchor.id.as_bytes());
         hasher.update(proposer.as_bytes());
         hasher.update(&timestamp.to_le_bytes());
@@ -368,7 +375,7 @@ impl ConsensusFrame {
     /// 
     /// This prevents malicious nodes from constructing CFs with mismatched IDs.
     pub fn verify_id(&self) -> bool {
-        let expected_id = Self::compute_id(&self.anchor, &self.proposer, self.created_at);
+        let expected_id = Self::compute_id(self.round, &self.anchor, &self.proposer, self.created_at);
         self.id == expected_id
     }
 }
@@ -427,7 +434,7 @@ mod tests {
             None,
             0,
         );
-        let mut cf = ConsensusFrame::new(anchor, "validator1".to_string());
+        let mut cf = ConsensusFrame::new(0, anchor, "validator1".to_string());
 
         cf.add_vote(Vote::new("validator1".to_string(), cf.id.clone(), true));
         cf.add_vote(Vote::new("validator2".to_string(), cf.id.clone(), true));
@@ -436,5 +443,61 @@ mod tests {
         assert_eq!(cf.approve_count(), 3);
         assert_eq!(cf.reject_count(), 0);
         assert!(cf.check_quorum(3));
+    }
+
+    #[test]
+    fn consensus_frame_round_in_id() {
+        let anchor = Anchor::new(
+            vec!["e1".to_string()],
+            create_vlc_snapshot(),
+            "state_root".to_string(),
+            None,
+            0,
+        );
+        // Two CFs identical except for round must produce distinct IDs.
+        let timestamp = 12345u64;
+        let id_r0 = ConsensusFrame::compute_id(0, &anchor, "v1", timestamp);
+        let id_r1 = ConsensusFrame::compute_id(1, &anchor, "v1", timestamp);
+        assert_ne!(id_r0, id_r1, "round must affect compute_id output");
+    }
+
+    #[test]
+    fn consensus_frame_verify_id_detects_round_tamper() {
+        let anchor = Anchor::new(
+            vec!["e1".to_string()],
+            create_vlc_snapshot(),
+            "state_root".to_string(),
+            None,
+            0,
+        );
+        let mut cf = ConsensusFrame::new(5, anchor, "v1".to_string());
+        assert!(cf.verify_id(), "fresh CF must self-verify");
+        cf.round = 999;
+        assert!(!cf.verify_id(), "tampered round must invalidate id");
+    }
+
+    #[test]
+    fn consensus_frame_id_v2_domain_separator_diverges_from_v1() {
+        // Hand-compute a V1-style id (legacy domain, no round) and compare
+        // against V2 with round=0; they must differ so V1 blobs decoded into
+        // V2 structs cannot accidentally self-verify.
+        let anchor = Anchor::new(
+            vec!["e1".to_string()],
+            create_vlc_snapshot(),
+            "state_root".to_string(),
+            None,
+            0,
+        );
+        let timestamp = 7777u64;
+        let v2_id = ConsensusFrame::compute_id(0, &anchor, "v1", timestamp);
+
+        let mut h = blake3::Hasher::new();
+        h.update(b"SETU_CF_ID:");
+        h.update(anchor.id.as_bytes());
+        h.update(b"v1");
+        h.update(&timestamp.to_le_bytes());
+        let v1_id = hex::encode(h.finalize().as_bytes());
+
+        assert_ne!(v1_id, v2_id, "V1 and V2 domains must produce distinct ids");
     }
 }
