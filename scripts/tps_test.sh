@@ -3,62 +3,62 @@
 # Setu TPS Benchmark Test Script
 # ===============================
 # 
-# 功能:
-#   1. 关闭代理
-#   2. 创建日志目录
-#   3. 启动 Validator 和 Solver (数量可配置)
-#   4. 运行 Benchmark 测试
-#   5. 收集日志和结果
+# Features:
+#   1. Disable proxy
+#   2. Create log directory
+#   3. Start Validator and Solver (counts are configurable)
+#   4. Run Benchmark test
+#   5. Collect logs and results
 #
-# 用法:
+# Usage:
 #   ./scripts/tps_test.sh [OPTIONS]
 #
-# 示例:
-#   ./scripts/tps_test.sh                           # 默认配置
-#   ./scripts/tps_test.sh -s 3 -t 1000 -c 100       # 3个Solver, 1000交易, 100并发
-#   ./scripts/tps_test.sh --solvers 5 --sustained  # 5个Solver, 持续模式
+# Examples:
+#   ./scripts/tps_test.sh                           # Default configuration
+#   ./scripts/tps_test.sh -s 3 -t 1000 -c 100       # 3 solvers, 1000 transactions, concurrency 100
+#   ./scripts/tps_test.sh --solvers 5 --sustained  # 5 solvers, sustained mode
 #
 
 set -e
 
 # ============================================================================
-# 默认配置
+# Default configuration
 # ============================================================================
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_BASE_DIR="${PROJECT_ROOT}/logs"
 
-# 服务配置
-NUM_VALIDATORS=1          # Validator 数量 (当前仅支持1个)
-NUM_SOLVERS=1             # Solver 数量
-VALIDATOR_PORT=8080       # Validator 端口
-SOLVER_BASE_PORT=9001     # Solver 起始端口
+# Service configuration
+NUM_VALIDATORS=1          # Number of validators (currently only 1 is supported)
+NUM_SOLVERS=1             # Number of solvers
+VALIDATOR_PORT=8080       # Validator port
+SOLVER_BASE_PORT=9001     # Solver base port
 
-# Benchmark 配置
-TOTAL_REQUESTS=500        # 总请求数
-CONCURRENCY=50            # 并发数
-WARMUP_REQUESTS=50        # 预热请求数
-USE_TEST_ACCOUNTS=true    # 使用测试账户
-INIT_ACCOUNTS=100         # 初始化测试账户数量 (0=不初始化，使用种子账户)
-INIT_ACCOUNT_BALANCE=100000  # 每个测试账户的初始余额
-COINS_PER_ACCOUNT=5       # 每个账户的 coin 对象数 (多 Coin 模型, 更多=更高单账户并行度, 建议≥5)
-BENCHMARK_MODE="burst"    # 模式: burst, sustained, ramp
-SUSTAINED_DURATION=30     # sustained 模式持续时间(秒)
-SUSTAINED_TPS=100         # sustained 模式目标 TPS
-RAMP_START=10             # ramp 模式起始 TPS
-RAMP_STEP=10              # ramp 模式每步递增 TPS
-RAMP_STEP_DURATION=10     # ramp 模式每步持续时间(秒)
-RAMP_DURATION=60          # ramp 模式总时间(秒)
-USE_BATCH=false           # 使用批量 API
-BATCH_SIZE=50             # 批量大小
+# Benchmark configuration
+TOTAL_REQUESTS=500        # Total requests
+CONCURRENCY=50            # Concurrency
+WARMUP_REQUESTS=50        # Warmup requests
+USE_TEST_ACCOUNTS=true    # Use test accounts
+INIT_ACCOUNTS=100         # Number of test accounts to initialize (0=skip init, use seed accounts)
+INIT_ACCOUNT_BALANCE=100000  # Initial balance per test account
+COINS_PER_ACCOUNT=5       # Coin objects per account (multi-coin model; more = higher per-account parallelism, recommended >=5)
+BENCHMARK_MODE="burst"    # Mode: burst, sustained, ramp
+SUSTAINED_DURATION=30     # sustained mode duration (seconds)
+SUSTAINED_TPS=100         # sustained mode target TPS
+RAMP_START=10             # ramp mode starting TPS
+RAMP_STEP=10              # ramp mode TPS increment per step
+RAMP_STEP_DURATION=10     # ramp mode duration per step (seconds)
+RAMP_DURATION=60          # ramp mode total time (seconds)
+USE_BATCH=false           # Use batch API
+BATCH_SIZE=50             # Batch size
 
-# 其他配置
-MOCK_TEE=true             # 使用 Mock TEE
-RUST_LOG_LEVEL="warn"     # 日志级别: error, warn, info, debug, trace
-WAIT_STARTUP=5            # 服务启动等待时间(秒)
-HEALTH_CHECK_RETRIES=10   # 健康检查重试次数
+# Other configuration
+MOCK_TEE=true             # Use Mock TEE
+RUST_LOG_LEVEL="warn"     # Log level: error, warn, info, debug, trace
+WAIT_STARTUP=5            # Service startup wait time (seconds)
+HEALTH_CHECK_RETRIES=10   # Health check retry count
 
 # ============================================================================
-# 颜色输出
+# Colored output
 # ============================================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -74,64 +74,64 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${CYAN}==>${NC} $1"; }
 
 # ============================================================================
-# 帮助信息
+# Help information
 # ============================================================================
 show_help() {
     cat << EOF
 Setu TPS Benchmark Test Script
 
-用法: $0 [OPTIONS]
+Usage: $0 [OPTIONS]
 
-服务配置:
-  -s, --solvers NUM       Solver 数量 (默认: $NUM_SOLVERS)
-  -p, --port PORT         Validator 端口 (默认: $VALIDATOR_PORT)
-  --mock-tee              使用 Mock TEE (默认: $MOCK_TEE)
-  --real-tee              使用真实 TEE
+Service configuration:
+  -s, --solvers NUM       Number of solvers (default: $NUM_SOLVERS)
+  -p, --port PORT         Validator port (default: $VALIDATOR_PORT)
+  --mock-tee              Use Mock TEE (default: $MOCK_TEE)
+  --real-tee              Use real TEE
 
-Benchmark 配置:
-  -t, --requests NUM      总请求数 (默认: $TOTAL_REQUESTS)
-  -c, --concurrency NUM   并发数 (默认: $CONCURRENCY)
-  -w, --warmup NUM        预热请求数 (默认: $WARMUP_REQUESTS)
-  --no-test-accounts      不使用测试账户
-  --init-accounts NUM     初始化测试账户数量 (默认: $INIT_ACCOUNTS, 0=使用种子账户)
-  --init-balance NUM      每个测试账户初始余额 (默认: $INIT_ACCOUNT_BALANCE)
-  --coins-per-account N   每账户 coin 对象数 (默认: $COINS_PER_ACCOUNT, 多 Coin 模型, 更多=更高并发)
+Benchmark configuration:
+  -t, --requests NUM      Total requests (default: $TOTAL_REQUESTS)
+  -c, --concurrency NUM   Concurrency (default: $CONCURRENCY)
+  -w, --warmup NUM        Warmup requests (default: $WARMUP_REQUESTS)
+  --no-test-accounts      Do not use test accounts
+  --init-accounts NUM     Test accounts to initialize (default: $INIT_ACCOUNTS, 0=use seed accounts)
+  --init-balance NUM      Initial balance per test account (default: $INIT_ACCOUNT_BALANCE)
+  --coins-per-account N   Coin objects per account (default: $COINS_PER_ACCOUNT, multi-coin model; more = higher concurrency)
 
-Benchmark 模式:
-  --burst                 突发模式 (默认)
-  --sustained             持续模式
-  --sustained-duration S  持续模式时长 (默认: $SUSTAINED_DURATION 秒)
-  --sustained-tps TPS     持续模式目标 TPS (默认: $SUSTAINED_TPS)
-  --ramp                  渐进模式
-  --ramp-start TPS        渐进模式起始 TPS (默认: $RAMP_START)
-  --ramp-step TPS         渐进模式每步递增 TPS (默认: $RAMP_STEP)
-  --ramp-step-duration S  渐进模式每步持续时间 (默认: $RAMP_STEP_DURATION 秒)
-  --ramp-duration S       渐进模式总持续时间 (默认: $RAMP_DURATION 秒)
-  --batch                 启用批量 API 模式
-  --batch-size SIZE       批量大小 (默认: $BATCH_SIZE)
+Benchmark modes:
+  --burst                 Burst mode (default)
+  --sustained             Sustained mode
+  --sustained-duration S  Sustained mode duration (default: $SUSTAINED_DURATIONs)
+  --sustained-tps TPS     Sustained mode target TPS (default: $SUSTAINED_TPS)
+  --ramp                  Ramp mode
+  --ramp-start TPS        Ramp mode starting TPS (default: $RAMP_START)
+  --ramp-step TPS         Ramp mode TPS increment per step (default: $RAMP_STEP)
+  --ramp-step-duration S  Ramp mode duration per step (default: $RAMP_STEP_DURATIONs)
+  --ramp-duration S       Ramp mode total duration (default: $RAMP_DURATIONs)
+  --batch                 Enable batch API mode
+  --batch-size SIZE       Batch size (default: $BATCH_SIZE)
 
-日志配置:
-  -l, --log-level LEVEL   日志级别: error,warn,info,debug,trace (默认: $RUST_LOG_LEVEL)
-  --log-dir DIR           日志目录 (默认: $LOG_BASE_DIR)
+Log configuration:
+  -l, --log-level LEVEL   Log level: error,warn,info,debug,trace (default: $RUST_LOG_LEVEL)
+  --log-dir DIR           Log directory (default: $LOG_BASE_DIR)
 
-其他:
-  -h, --help              显示帮助信息
-  --dry-run               仅显示配置，不执行
+Other:
+  -h, --help              Show help
+  --dry-run               Show configuration only, do not execute
 
-示例:
-  $0                                    # 默认配置测试
-  $0 -s 3 -t 1000 -c 100               # 3个Solver, 1000请求, 100并发
-  $0 --solvers 5 --sustained           # 5个Solver, 持续模式
-  $0 -s 2 -t 5000 -c 200 -l info       # 高负载测试，info日志
-  $0 --init-accounts 100 -c 100        # 初始化100账户, 100并发
-  $0 --init-accounts 200 -c 200 --batch  # 高并发批量测试
+Examples:
+  $0                                    # Default configuration test
+  $0 -s 3 -t 1000 -c 100               # 3 solvers, 1000 requests, concurrency 100
+  $0 --solvers 5 --sustained           # 5 solvers, sustained mode
+  $0 -s 2 -t 5000 -c 200 -l info       # High-load test, info logs
+  $0 --init-accounts 100 -c 100        # Initialize 100 accounts, concurrency 100
+  $0 --init-accounts 200 -c 200 --batch  # High-concurrency batch test
 
 EOF
     exit 0
 }
 
 # ============================================================================
-# 解析参数
+# Parse arguments
 # ============================================================================
 DRY_RUN=false
 
@@ -241,14 +241,14 @@ while [[ $# -gt 0 ]]; do
             show_help
             ;;
         *)
-            log_error "未知参数: $1"
+            log_error "Unknown argument: $1"
             show_help
             ;;
     esac
 done
 
 # ============================================================================
-# 创建日志目录
+# Create log directory
 # ============================================================================
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 TEST_LOG_DIR="${LOG_BASE_DIR}/${TIMESTAMP}"
@@ -258,15 +258,15 @@ RESULT_FILE="${TEST_LOG_DIR}/result.txt"
 CONFIG_FILE="${TEST_LOG_DIR}/config.json"
 
 create_log_dir() {
-    log_step "创建日志目录: ${TEST_LOG_DIR}"
+    log_step "Create log directory: ${TEST_LOG_DIR}"
     mkdir -p "${TEST_LOG_DIR}"
     
-    # 收集系统信息
+    # Collect system info
     local cpu_info=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1 | cut -d: -f2 || echo "Unknown")
     local cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo "Unknown")
     local memory_gb=$(echo "scale=1; $(sysctl -n hw.memsize 2>/dev/null || grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2*1024}' || echo 0) / 1073741824" | bc 2>/dev/null || echo "Unknown")
     
-    # 保存配置
+    # Save configuration
     cat > "${CONFIG_FILE}" << EOF
 {
     "timestamp": "${TIMESTAMP}",
@@ -307,73 +307,73 @@ create_log_dir() {
     }
 }
 EOF
-    log_ok "配置已保存到 ${CONFIG_FILE}"
+    log_ok "Configuration saved to ${CONFIG_FILE}"
 }
 
 # ============================================================================
-# 关闭代理
+# Disable proxy
 # ============================================================================
 disable_proxy() {
-    log_step "关闭代理设置"
+    log_step "Disabling proxy settings"
     unset http_proxy
     unset https_proxy
     unset HTTP_PROXY
     unset HTTPS_PROXY
     export NO_PROXY="127.0.0.1,localhost,*"
-    log_ok "代理已关闭"
+    log_ok "Proxy disabled"
 }
 
 # ============================================================================
-# 清理旧进程
+# Clean up old processes
 # ============================================================================
 cleanup_processes() {
-    log_step "清理旧进程"
+    log_step "Cleaning up old processes"
     pkill -f "setu-validator" 2>/dev/null || true
     pkill -f "setu-solver" 2>/dev/null || true
     sleep 1
     
-    # 确认端口已释放
+    # Confirm port has been released
     for port in $(seq $VALIDATOR_PORT $VALIDATOR_PORT) $(seq $SOLVER_BASE_PORT $((SOLVER_BASE_PORT + NUM_SOLVERS - 1))); do
         if lsof -i :$port >/dev/null 2>&1; then
-            log_warn "端口 $port 仍被占用，强制释放"
+            log_warn "Port $port is still in use; forcing release"
             lsof -i :$port | awk 'NR>1 {print $2}' | xargs -r kill -9 2>/dev/null || true
         fi
     done
     sleep 1
-    log_ok "旧进程已清理"
+    log_ok "Old processes cleaned up"
 }
 
 # ============================================================================
-# 清理数据库
+# Clean database
 # ============================================================================
 cleanup_database() {
-    log_step "清理数据库"
-    # 确认无残留进程占用数据库
+    log_step "Cleaning database"
+    # Confirm no leftover processes are holding the database
     local retries=0
     while [ $retries -lt 5 ]; do
         if ! pgrep -f "setu-validator" >/dev/null 2>&1 && ! pgrep -f "setu-solver" >/dev/null 2>&1; then
             break
         fi
         retries=$((retries + 1))
-        log_info "等待进程完全退出... ($retries/5)"
+        log_info "Waiting for processes to exit completely... ($retries/5)"
         sleep 1
     done
     rm -rf "${PROJECT_ROOT}/example_db"
-    log_ok "数据库已清理"
+    log_ok "Database cleaned"
 }
 
 # ============================================================================
-# 启动 Validator
+# Start Validator
 # ============================================================================
 start_validator() {
-    log_step "启动 Validator"
+    log_step "Starting Validator"
     
     local tee_flag=""
     if [ "$MOCK_TEE" = true ]; then
         tee_flag="--mock-tee"
     fi
     
-    # 明确设置环境变量禁用代理，并通过环境变量配置 Validator
+    # Explicitly set env vars to disable proxy and configure Validator
     env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
     NO_PROXY="127.0.0.1,localhost,*" \
     RUST_LOG="${RUST_LOG_LEVEL}" \
@@ -386,31 +386,31 @@ start_validator() {
     echo $VALIDATOR_PID > "${TEST_LOG_DIR}/validator.pid"
     
     log_info "Validator PID: ${VALIDATOR_PID}"
-    log_info "等待 Validator 启动..."
+    log_info "Waiting for Validator to start..."
     sleep ${WAIT_STARTUP}
     
-    # 检查健康状态 (带重试)
+    # Check health (with retries)
     local retries=0
     while [ $retries -lt $HEALTH_CHECK_RETRIES ]; do
         if curl -s "http://127.0.0.1:${VALIDATOR_PORT}/api/v1/health" 2>/dev/null | grep -q "healthy"; then
-            log_ok "Validator 启动成功"
+            log_ok "Validator started successfully"
             return 0
         fi
         retries=$((retries + 1))
-        log_info "等待 Validator 就绪... ($retries/$HEALTH_CHECK_RETRIES)"
+        log_info "Waiting for Validator to be ready... ($retries/$HEALTH_CHECK_RETRIES)"
         sleep 1
     done
     
-    log_error "Validator 启动失败"
+    log_error "Validator failed to start"
     cat "${VALIDATOR_LOG}"
     exit 1
 }
 
 # ============================================================================
-# 启动 Solvers
+# Start Solvers
 # ============================================================================
 start_solvers() {
-    log_step "启动 ${NUM_SOLVERS} 个 Solver"
+    log_step "Starting ${NUM_SOLVERS} Solver(s)"
     
     local tee_flag=""
     if [ "$MOCK_TEE" = true ]; then
@@ -421,8 +421,8 @@ start_solvers() {
         local solver_port=$((SOLVER_BASE_PORT + i - 1))
         local solver_log="${TEST_LOG_DIR}/solver_${i}.log"
         
-        # 使用环境变量配置 Solver（而不是命令行参数）
-        # 明确设置禁用代理的环境变量
+        # Configure Solver via env vars (instead of CLI args)
+        # Explicitly set env vars to disable proxy
         env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
         NO_PROXY="127.0.0.1,localhost,*" \
         SOLVER_ID="solver_${i}" \
@@ -439,41 +439,41 @@ start_solvers() {
         log_info "Solver ${i} PID: ${solver_pid}, Port: ${solver_port}"
     done
     
-    log_info "等待 Solvers 启动..."
+    log_info "Waiting for Solvers to start..."
     
-    # 等待所有 Solver 注册 (带重试)
+    # Wait for all solvers to register (with retries)
     local retries=0
     local solver_count=0
     while [ $retries -lt $HEALTH_CHECK_RETRIES ]; do
         solver_count=$(curl -s "http://127.0.0.1:${VALIDATOR_PORT}/api/v1/health" 2>/dev/null | grep -o '"solver_count":[0-9]*' | grep -o '[0-9]*' || echo "0")
         if [ "$solver_count" -ge "$NUM_SOLVERS" ]; then
-            log_ok "所有 ${NUM_SOLVERS} 个 Solver 启动成功 (注册数: ${solver_count})"
+            log_ok "All ${NUM_SOLVERS} solver(s) started (registered: ${solver_count})"
             return 0
         fi
         retries=$((retries + 1))
-        log_info "等待 Solver 注册... ($solver_count/$NUM_SOLVERS) [$retries/$HEALTH_CHECK_RETRIES]"
+        log_info "Waiting for Solver registration... ($solver_count/$NUM_SOLVERS) [$retries/$HEALTH_CHECK_RETRIES]"
         sleep 1
     done
     
-    log_warn "Solver 启动可能不完整 (期望: ${NUM_SOLVERS}, 注册: ${solver_count})"
+    log_warn "Solver startup may be incomplete (expected: ${NUM_SOLVERS}, registered: ${solver_count})"
 }
 
 # ============================================================================
-# 运行 Benchmark
+# Run Benchmark
 # ============================================================================
 run_benchmark() {
-    log_step "运行 Benchmark 测试"
+    log_step "Running Benchmark test"
     
-    # 检查 Validator 进程是否仍在运行
+    # Check whether the Validator process is still running
     if [ -f "${TEST_LOG_DIR}/validator.pid" ]; then
         local vpid=$(cat "${TEST_LOG_DIR}/validator.pid")
         if ! kill -0 "$vpid" 2>/dev/null; then
-            log_error "Validator 进程(PID: $vpid)已退出!"
-            log_error "最后 20 行日志:"
+            log_error "Validator process (PID: $vpid) has exited!"
+            log_error "Last 20 lines of logs:"
             tail -20 "${VALIDATOR_LOG}" 2>/dev/null
             exit 1
         fi
-        log_ok "Validator 进程(PID: $vpid)运行中"
+        log_ok "Validator process (PID: $vpid) is running"
     fi
     
     local benchmark_args="-t ${TOTAL_REQUESTS} -c ${CONCURRENCY}"
@@ -482,7 +482,7 @@ run_benchmark() {
         benchmark_args="${benchmark_args} --use-test-accounts"
     fi
     
-    # 账户初始化参数
+    # Account initialization parameters
     if [ "$INIT_ACCOUNTS" -gt 0 ]; then
         benchmark_args="${benchmark_args} --init-accounts ${INIT_ACCOUNTS} --init-account-balance ${INIT_ACCOUNT_BALANCE} --coins-per-account ${COINS_PER_ACCOUNT}"
     fi
@@ -491,12 +491,12 @@ run_benchmark() {
         benchmark_args="${benchmark_args} --warmup ${WARMUP_REQUESTS}"
     fi
     
-    # 批量 API 参数
+    # Batch API parameters
     if [ "$USE_BATCH" = true ]; then
         benchmark_args="${benchmark_args} --use-batch --batch-size ${BATCH_SIZE}"
     fi
     
-    # 根据模式添加参数
+    # Add parameters based on mode
     case $BENCHMARK_MODE in
         sustained)
             benchmark_args="${benchmark_args} -m sustained --duration ${SUSTAINED_DURATION} --target-tps ${SUSTAINED_TPS}"
@@ -505,16 +505,16 @@ run_benchmark() {
             benchmark_args="${benchmark_args} -m ramp --duration ${RAMP_DURATION} --ramp-start ${RAMP_START} --ramp-step ${RAMP_STEP} --ramp-step-duration ${RAMP_STEP_DURATION}"
             ;;
         *)
-            # burst 模式是默认
+            # burst mode is the default
             benchmark_args="${benchmark_args} -m burst"
             ;;
     esac
     
-    log_info "Benchmark 参数: ${benchmark_args}"
-    echo "Benchmark 参数: ${benchmark_args}" >> "${RESULT_FILE}"
+    log_info "Benchmark args: ${benchmark_args}"
+    echo "Benchmark args: ${benchmark_args}" >> "${RESULT_FILE}"
     echo "======================================" >> "${RESULT_FILE}"
     
-    # 运行 Benchmark（明确禁用代理）
+    # Run Benchmark (proxy explicitly disabled)
     env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
     NO_PROXY="127.0.0.1,localhost,*" \
     "${PROJECT_ROOT}/target/release/setu-benchmark" \
@@ -522,170 +522,170 @@ run_benchmark() {
         ${benchmark_args} \
         2>&1 | tee -a "${BENCHMARK_LOG}" "${RESULT_FILE}"
     
-    log_ok "Benchmark 完成"
+    log_ok "Benchmark complete"
 }
 
 # ============================================================================
-# 收集结果
+# Collect results
 # ============================================================================
 collect_results() {
-    log_step "收集测试结果"
+    log_step "Collecting test results"
     
-    # 提取关键指标 (使用更精确的正则)
+    # Extract key metrics (with stricter regex)
     local tps=$(grep "Final TPS" "${RESULT_FILE}" | grep -o "TPS: [0-9.]*" | grep -o "[0-9.]*" || echo "N/A")
     local success_rate=$(grep "Final TPS" "${RESULT_FILE}" | grep -o "Success Rate: [0-9.]*%" | grep -o "[0-9.]*%" || echo "N/A")
     local p99=$(grep "Final TPS" "${RESULT_FILE}" | grep -o "P99 Latency: [0-9.]*ms" | grep -o "[0-9.]*" || echo "N/A")
     [ "$p99" != "N/A" ] && p99="${p99} ms"
     
-    # 批量模式信息
+    # Batch mode info
     local batch_info=""
     if [ "$USE_BATCH" = true ]; then
-        batch_info=" (批量: ${BATCH_SIZE})"
+        batch_info=" (batch: ${BATCH_SIZE})"
     fi
     
-    # 账户初始化信息
+    # Account init info
     local init_info=""
     if [ "$INIT_ACCOUNTS" -gt 0 ]; then
-        init_info=" (初始化: ${INIT_ACCOUNTS}账户)"
+        init_info=" (init: ${INIT_ACCOUNTS} accounts)"
     fi
 
-    # 生成摘要
+    # Generate summary
     cat >> "${RESULT_FILE}" << EOF
 
 ======================================
-测试摘要
+Test Summary
 ======================================
-时间戳:       ${TIMESTAMP}
-Solver 数量:  ${NUM_SOLVERS}
-总请求数:     ${TOTAL_REQUESTS}
-并发数:       ${CONCURRENCY}
-模式:         ${BENCHMARK_MODE}${batch_info}${init_info}
-批量API:      ${USE_BATCH}
-批量大小:     ${BATCH_SIZE}
-初始化账户:   ${INIT_ACCOUNTS}
+Timestamp:       ${TIMESTAMP}
+Number of solvers:  ${NUM_SOLVERS}
+Total requests:     ${TOTAL_REQUESTS}
+Concurrency:       ${CONCURRENCY}
+Mode:         ${BENCHMARK_MODE}${batch_info}${init_info}
+Batch API:      ${USE_BATCH}
+Batch size:     ${BATCH_SIZE}
+Init accounts:   ${INIT_ACCOUNTS}
 
-结果:
+Results:
   TPS:          ${tps}
-  成功率:       ${success_rate}
-  P99 延迟:     ${p99}
+  Success rate:       ${success_rate}
+  P99 latency:     ${p99}
 ======================================
 EOF
 
-    log_ok "结果已保存到: ${RESULT_FILE}"
+    log_ok "Results saved to: ${RESULT_FILE}"
     
-    # 显示摘要
+    # Display summary
     echo ""
     echo "=============================================="
-    echo -e "${GREEN}测试完成!${NC}"
+    echo -e "${GREEN}Test complete!${NC}"
     echo "=============================================="
-    echo "  日志目录:   ${TEST_LOG_DIR}"
-    echo "  Solver数量: ${NUM_SOLVERS}"
-    echo "  总请求:     ${TOTAL_REQUESTS}"
-    echo "  并发:       ${CONCURRENCY}"
+    echo "  Log directory:   ${TEST_LOG_DIR}"
+    echo "  Solver count: ${NUM_SOLVERS}"
+    echo "  Total requests:     ${TOTAL_REQUESTS}"
+    echo "  Concurrency:       ${CONCURRENCY}"
     if [ "$INIT_ACCOUNTS" -gt 0 ]; then
-        echo "  初始化账户: ${INIT_ACCOUNTS}"
+        echo "  Init accounts: ${INIT_ACCOUNTS}"
     fi
     if [ "$USE_BATCH" = true ]; then
-        echo "  批量模式:   是 (batch_size=${BATCH_SIZE})"
+        echo "  Batch mode:   yes (batch_size=${BATCH_SIZE})"
     fi
     echo ""
     echo -e "  ${CYAN}TPS:${NC}        ${tps}"
-    echo -e "  ${CYAN}成功率:${NC}     ${success_rate}"
-    echo -e "  ${CYAN}P99延迟:${NC}    ${p99}"
+    echo -e "  ${CYAN}Success rate:${NC}     ${success_rate}"
+    echo -e "  ${CYAN}P99 latency:${NC}    ${p99}"
     echo "=============================================="
 }
 
 # ============================================================================
-# 清理函数
+# Cleanup function
 # ============================================================================
 cleanup() {
-    log_step "清理进程"
+    log_step "Cleaning up processes"
     pkill -f "setu-validator" 2>/dev/null || true
     pkill -f "setu-solver" 2>/dev/null || true
-    log_ok "进程已清理"
+    log_ok "Processes cleaned up"
 }
 
 # ============================================================================
-# 显示配置 (dry-run)
+# Show configuration (dry-run)
 # ============================================================================
 show_config() {
     echo ""
     echo "=============================================="
-    echo "测试配置 (Dry Run)"
+    echo "Test Configuration (Dry Run)"
     echo "=============================================="
-    echo "服务配置:"
-    echo "  Validator 数量: ${NUM_VALIDATORS}"
-    echo "  Solver 数量:    ${NUM_SOLVERS}"
-    echo "  Validator 端口: ${VALIDATOR_PORT}"
-    echo "  Solver 起始端口: ${SOLVER_BASE_PORT}"
+    echo "Service configuration:"
+    echo "  Validator count: ${NUM_VALIDATORS}"
+    echo "  Number of solvers:    ${NUM_SOLVERS}"
+    echo "  Validator port: ${VALIDATOR_PORT}"
+    echo "  Solver base port: ${SOLVER_BASE_PORT}"
     echo "  Mock TEE:       ${MOCK_TEE}"
     echo ""
-    echo "Benchmark 配置:"
-    echo "  模式:           ${BENCHMARK_MODE}"
-    echo "  总请求数:       ${TOTAL_REQUESTS}"
-    echo "  并发数:         ${CONCURRENCY}"
-    echo "  预热请求:       ${WARMUP_REQUESTS}"
-    echo "  使用测试账户:   ${USE_TEST_ACCOUNTS}"
+    echo "Benchmark configuration:"
+    echo "  Mode:           ${BENCHMARK_MODE}"
+    echo "  Total requests:       ${TOTAL_REQUESTS}"
+    echo "  Concurrency:         ${CONCURRENCY}"
+    echo "  Warmup requests:       ${WARMUP_REQUESTS}"
+    echo "  Use test accounts:   ${USE_TEST_ACCOUNTS}"
     if [ "$INIT_ACCOUNTS" -gt 0 ]; then
-        echo "  初始化账户:     ${INIT_ACCOUNTS}"
-        echo "  账户初始余额:   ${INIT_ACCOUNT_BALANCE}"
-        echo "  Coins/账户:     ${COINS_PER_ACCOUNT}"
+        echo "  Init accounts:     ${INIT_ACCOUNTS}"
+        echo "  Account initial balance:   ${INIT_ACCOUNT_BALANCE}"
+        echo "  Coins per account:     ${COINS_PER_ACCOUNT}"
     fi
     if [ "$USE_BATCH" = true ]; then
-        echo "  批量模式:       是"
-        echo "  批量大小:       ${BATCH_SIZE}"
+        echo "  Batch mode:       yes"
+        echo "  Batch size:       ${BATCH_SIZE}"
     fi
     if [ "$BENCHMARK_MODE" = "sustained" ]; then
-        echo "  持续时间:       ${SUSTAINED_DURATION}s"
-        echo "  目标 TPS:       ${SUSTAINED_TPS}"
+        echo "  Duration:       ${SUSTAINED_DURATION}s"
+        echo "  Target TPS:       ${SUSTAINED_TPS}"
     fi
     if [ "$BENCHMARK_MODE" = "ramp" ]; then
-        echo "  渐进起始TPS:    ${RAMP_START}"
-        echo "  渐进递增:       ${RAMP_STEP} TPS/步"
-        echo "  每步时长:       ${RAMP_STEP_DURATION}s"
-        echo "  总时长:         ${RAMP_DURATION}s"
+        echo "  Ramp start TPS:    ${RAMP_START}"
+        echo "  Ramp step:       ${RAMP_STEP} TPS/step"
+        echo "  Step duration:       ${RAMP_STEP_DURATION}s"
+        echo "  Total duration:         ${RAMP_DURATION}s"
     fi
     echo ""
-    echo "日志配置:"
-    echo "  日志级别:       ${RUST_LOG_LEVEL}"
-    echo "  日志目录:       ${TEST_LOG_DIR}"
+    echo "Log configuration:"
+    echo "  Log level:       ${RUST_LOG_LEVEL}"
+    echo "  Log directory:       ${TEST_LOG_DIR}"
     echo "=============================================="
 }
 
 # ============================================================================
-# 配置验证
+# Configuration validation
 # ============================================================================
 validate_config() {
-    log_step "验证配置"
+    log_step "Validating configuration"
     local warnings=0
     
-    # 检查 INIT_ACCOUNTS 与 CONCURRENCY 的比例
+    # Check ratio of INIT_ACCOUNTS to CONCURRENCY
     if [ "$INIT_ACCOUNTS" -gt 0 ] && [ "$INIT_ACCOUNTS" -lt "$CONCURRENCY" ]; then
-        log_warn "INIT_ACCOUNTS($INIT_ACCOUNTS) < CONCURRENCY($CONCURRENCY): coin 争用率高，建议 INIT_ACCOUNTS >= CONCURRENCY * 2"
+        log_warn "INIT_ACCOUNTS($INIT_ACCOUNTS) < CONCURRENCY($CONCURRENCY): high coin contention; recommend INIT_ACCOUNTS >= CONCURRENCY * 2"
         warnings=$((warnings + 1))
     fi
     
-    # 检查 COINS_PER_ACCOUNT
+    # Check COINS_PER_ACCOUNT
     if [ "$INIT_ACCOUNTS" -gt 0 ] && [ "$COINS_PER_ACCOUNT" -lt 2 ] && [ "$CONCURRENCY" -gt "$INIT_ACCOUNTS" ]; then
-        log_warn "COINS_PER_ACCOUNT($COINS_PER_ACCOUNT) 较低且并发超过账户数，建议增加至 >= 2"
+        log_warn "COINS_PER_ACCOUNT($COINS_PER_ACCOUNT) is too low and concurrency exceeds account count; recommend increasing to >= 2"
         warnings=$((warnings + 1))
     fi
     
-    # 检查预热数量不超过总请求数
+    # Check that warmup count does not exceed total requests
     if [ "$WARMUP_REQUESTS" -ge "$TOTAL_REQUESTS" ]; then
-        log_warn "WARMUP_REQUESTS($WARMUP_REQUESTS) >= TOTAL_REQUESTS($TOTAL_REQUESTS): 预热数量过大"
+        log_warn "WARMUP_REQUESTS($WARMUP_REQUESTS) >= TOTAL_REQUESTS($TOTAL_REQUESTS): warmup count is too large"
         warnings=$((warnings + 1))
     fi
     
     if [ $warnings -eq 0 ]; then
-        log_ok "配置验证通过"
+        log_ok "Configuration validation passed"
     else
-        log_warn "发现 ${warnings} 个配置警告 (继续执行)"
+        log_warn "Found ${warnings} configuration warning(s) (continuing)"
     fi
 }
 
 # ============================================================================
-# 主流程
+# Main flow
 # ============================================================================
 main() {
     echo ""
@@ -699,18 +699,18 @@ main() {
         exit 0
     fi
     
-    # 检查二进制文件
+    # Check binaries
     if [ ! -f "${PROJECT_ROOT}/target/release/setu-validator" ] || \
        [ ! -f "${PROJECT_ROOT}/target/release/setu-solver" ] || \
        [ ! -f "${PROJECT_ROOT}/target/release/setu-benchmark" ]; then
-        log_error "请先编译: cargo build --release"
+        log_error "Please build first: cargo build --release"
         exit 1
     fi
     
-    # 设置清理钩子
+    # Install cleanup hook
     trap cleanup EXIT
     
-    # 执行测试流程
+    # Run test flow
     disable_proxy
     create_log_dir
     validate_config
@@ -721,8 +721,8 @@ main() {
     run_benchmark
     collect_results
     
-    log_ok "测试完成!"
+    log_ok "Test complete!"
 }
 
-# 执行主流程
+# Run main flow
 main

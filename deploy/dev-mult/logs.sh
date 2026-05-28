@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 查看远程日志
-# 用法: ./logs.sh [1|2|3|all] [--tail N] [--follow] [--grep PATTERN]
+# View remote logs
+# Usage: ./logs.sh [1|2|3|all] [--tail N] [--follow] [--grep PATTERN]
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,10 +12,10 @@ TAIL_N=100
 FOLLOW=false
 GREP_PATTERN=""
 
-# 检测第一个参数是 flag 而非节点编号 — 默认 TARGET=all
+# First argument is a flag rather than a node number — default TARGET=all
 if [[ "$TARGET" == -* ]]; then
     TARGET="all"
-    # 不 shift，让 while 循环处理所有参数
+    # Don't shift; let the while loop handle all arguments
 else
     shift 2>/dev/null || true
 fi
@@ -45,10 +45,10 @@ show_logs() {
         if [ -n "$GREP_PATTERN" ]; then
             cmd="${cmd} | grep --line-buffered --color=always '${GREP_PATTERN}'"
         fi
-        echo "  (Ctrl+C 退出)"
+        echo "  (Ctrl+C to exit)"
         remote_exec "$host" "$cmd" || true
     else
-        remote_exec "$host" "$cmd" 2>/dev/null || echo "  (无日志)"
+        remote_exec "$host" "$cmd" 2>/dev/null || echo "  (no logs)"
         echo ""
     fi
 }
@@ -59,7 +59,7 @@ case "$TARGET" in
     3) show_logs 2 ;;
     all)
         if [ "$FOLLOW" = true ]; then
-            echo "follow 模式仅支持单节点，请指定节点: ./logs.sh 1 -f"
+            echo "follow mode supports a single node only; please specify a node: ./logs.sh 1 -f"
             exit 1
         fi
         for i in "${!SERVERS[@]}"; do
@@ -67,13 +67,13 @@ case "$TARGET" in
         done
         ;;
     *)
-        echo "用法: $0 [1|2|3|all] [--tail N] [--follow] [--grep PATTERN]"
+        echo "Usage: $0 [1|2|3|all] [--tail N] [--follow] [--grep PATTERN]"
         echo ""
-        echo "示例:"
-        echo "  $0 1 -f              # 实时跟踪 validator-1 日志"
-        echo "  $0 all -n 50         # 所有节点最近 50 行"
-        echo "  $0 2 --grep ERROR    # validator-2 的错误日志"
-        echo "  $0 all --grep 'CF.*finalize'  # 所有节点的 CF finalize 日志"
+        echo "Examples:"
+        echo "  $0 1 -f              # Tail validator-1 logs in real time"
+        echo "  $0 all -n 50         # Last 50 lines from all nodes"
+        echo "  $0 2 --grep ERROR    # Error logs from validator-2"
+        echo "  $0 all --grep 'CF.*finalize'  # CF finalize logs from all nodes"
         exit 1
         ;;
 esac

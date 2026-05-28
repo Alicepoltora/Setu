@@ -1,12 +1,12 @@
 #!/bin/bash
-# scripts/build_stdlib.sh — 编译 setu-framework Move 模块到 .mv 字节码
+# scripts/build_stdlib.sh — compile setu-framework Move modules into .mv bytecode
 #
-# 使用 tools/move-compile (非 Sui CLI)，避免 Sui CLI 版本兼容问题。
-# 添加新 Move 模块后须运行此脚本。
+# Uses tools/move-compile (not the Sui CLI) to avoid Sui CLI version compatibility issues.
+# Run this script after adding any new Move module.
 #
 # Usage:
-#   bash scripts/build_stdlib.sh          # 编译全部 + 一致性检查
-#   bash scripts/build_stdlib.sh --check  # 仅检查一致性（不编译）
+#   bash scripts/build_stdlib.sh          # Compile all + consistency check
+#   bash scripts/build_stdlib.sh --check  # Consistency check only (no compile)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

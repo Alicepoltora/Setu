@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# Setu Multi-Validator 远程部署配置
+# Setu Multi-Validator remote deployment configuration
 # ============================================================================
 
-# ── .env 配置加载 ────────────────────────────────────────────────────────────
-# 所有敏感信息（IP、密码）从 deploy/.env 读取 (格式: KEY = value)
-# 模板见 deploy/.env.example
+# ── .env loading ─────────────────────────────────────────────────────────
+# All sensitive values (IPs, passwords) are loaded from deploy/.env (format: KEY = value)
+# See deploy/.env.example for the template
 _ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
 if [ ! -f "$_ENV_FILE" ]; then
     echo "ERROR: deploy/.env not found. Copy deploy/.env.example to deploy/.env and fill in values."
@@ -25,7 +25,7 @@ _fail_if_env_placeholder() {
     esac
 }
 
-# ── 服务器列表 (从 .env 读取) ───────────────────────────────────────────────
+# ── Server list (loaded from .env) ─────────────────────────────────────────────────
 SERVERS=(
     "$(_read_env 'VALIDATOR-NODE-IP-01')"
     "$(_read_env 'VALIDATOR-NODE-IP-02')"
@@ -42,7 +42,7 @@ VALIDATOR_IDS=(
     "validator-3"
 )
 
-# ── SSH 配置 ─────────────────────────────────────────────────────────────────
+# ── SSH configuration ───────────────────────────────────────────────────────────────
 SSH_USER=$(_read_env 'VALIDATOR-NODE-USERNAME')
 SSH_PWD=$(_read_env 'VALIDATOR-NODE-PWD')
 SSH_USER="${SSH_USER:-root}"
@@ -67,10 +67,10 @@ _cleanup_ssh_control_sockets() {
 }
 trap _cleanup_ssh_control_sockets EXIT
 
-# 构建服务器 (默认使用第一台)
+# Build server (default: first host)
 BUILD_SERVER="${SERVERS[0]}"
 
-# ── 远程路径 ─────────────────────────────────────────────────────────────────
+# ── Remote paths ──────────────────────────────────────────────────────────────────────
 REMOTE_BASE="/opt/setu"
 REMOTE_SRC="${REMOTE_BASE}/src"
 REMOTE_BIN="${REMOTE_BASE}/bin"
@@ -79,23 +79,23 @@ REMOTE_CONFIG="${REMOTE_BASE}/config"
 REMOTE_DATA="${REMOTE_BASE}/data"
 REMOTE_LOGS="${REMOTE_BASE}/logs"
 
-# ── 端口配置 ─────────────────────────────────────────────────────────────────
-HTTP_PORT=8080          # HTTP API 端口 (所有节点统一)
-P2P_PORT=9000           # P2P 端口 (所有节点统一)
-SOLVER_PORT=9001        # Solver 端口
+# ── Port configuration ──────────────────────────────────────────────────────
+HTTP_PORT=8080          # HTTP API port (uniform across all nodes)
+P2P_PORT=9000           # P2P port (uniform across all nodes)
+SOLVER_PORT=9001        # Solver port
 
-# ── 日志级别 ─────────────────────────────────────────────────────────────────
+# ── Log level ─────────────────────────────────────────────────────────────
 RUST_LOG="info,setu_validator=debug,consensus=debug"
 
-# ── 本地项目路径 ─────────────────────────────────────────────────────────────
+# ── Local project paths ──────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ============================================================================
-# SSH 辅助函数
+# SSH helper functions
 # ============================================================================
 
-# 远程执行命令
+# Execute a command on a remote host
 remote_exec() {
     local host="$1"
     shift
@@ -106,7 +106,7 @@ remote_exec() {
     fi
 }
 
-# 远程复制文件 (本地 → 远程)
+# Copy a file (local -> remote)
 remote_copy() {
     local src="$1"
     local host="$2"
@@ -118,7 +118,7 @@ remote_copy() {
     fi
 }
 
-# 远程同步目录 (增量)
+# Sync a directory remotely (incremental)
 remote_sync() {
     local src="$1"
     local host="$2"
@@ -158,10 +158,11 @@ remote_sync() {
     fi
 }
 
-# 服务器间复制文件: 在 from_host 上执行 scp 直接推送到 to_host
-# (避免 scp -3 双重认证问题，使用 SSHPASS 环境变量避免密码引号问题)
-# 使用 INNER_SSH_OPTS 启用 BUILD_SERVER 端的 ControlMaster，缓解 inter-VM hop
-# 的 sshd MaxStartups/fail2ban 速率限制。
+# Server-to-server copy: run scp on from_host to push directly to to_host
+# (avoids the double-auth issue of scp -3; uses the SSHPASS env var to avoid
+# quoting issues with the password)
+# Uses INNER_SSH_OPTS to enable ControlMaster on BUILD_SERVER, mitigating
+# sshd MaxStartups / fail2ban rate-limiting on the inter-VM hop.
 remote_to_remote_copy() {
     local from_host="$1"
     local from_path="$2"
@@ -171,7 +172,7 @@ remote_to_remote_copy() {
         "SSHPASS='${SSH_PWD}' sshpass -e scp ${INNER_SSH_OPTS} '${from_path}' '${SSH_USER}@${to_host}:${to_path}'"
 }
 
-# 等待服务健康
+# Wait for a service to become healthy
 wait_for_health() {
     local host="$1"
     local port="$2"
@@ -187,7 +188,7 @@ wait_for_health() {
     return 1
 }
 
-# 获取 PEER_VALIDATORS 列表 (排除自身)
+# Build the PEER_VALIDATORS list (excluding self)
 get_peer_validators() {
     local self_index="$1"
     local peers=""
@@ -202,7 +203,7 @@ get_peer_validators() {
     echo "$peers"
 }
 
-# 打印分隔线
+# Print a separator/header line
 print_header() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"

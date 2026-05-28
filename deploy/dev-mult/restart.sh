@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 重启所有 Validator 节点
-# 用法: ./restart.sh [1|2|3|all]
+# Restart all validator nodes
+# Usage: ./restart.sh [1|2|3|all]
 # ============================================================================
 set -e
 
@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/config.sh"
 
 TARGET="${1:-all}"
 
-print_header "重启 Setu Validator 集群"
+print_header "Restart Setu Validator Cluster"
 
 bash "${SCRIPT_DIR}/stop.sh" "$TARGET"
 sleep 2

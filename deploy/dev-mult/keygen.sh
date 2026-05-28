@@ -1,41 +1,41 @@
 #!/bin/bash
 # ============================================================================
-# 生成 Validator 密钥对并更新 genesis-remote.json
-# 在构建服务器上使用 setu-cli 生成 ed25519 密钥
-# 用法: ./keygen.sh
+# Generate validator keypairs and update genesis-remote.json
+# Use setu-cli on the build server to generate ed25519 keys
+# Usage: ./keygen.sh
 # ============================================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-print_header "生成 Validator 密钥对"
+print_header "Generate Validator Keypairs"
 
-# 检查本地 jq (更新 genesis-remote.json 需要)
+# Check for local jq (needed to update genesis-remote.json)
 if ! command -v jq &>/dev/null; then
-    print_warn "jq 未安装，无法自动更新 genesis-remote.json 的公钥"
-    echo "  macOS 安装: brew install jq"
-    echo "  密钥仍会生成，但需手动更新公钥"
+    print_warn "jq not installed; cannot auto-update public keys in genesis-remote.json"
+    echo "  macOS install: brew install jq"
+    echo "  Keys will still be generated, but public keys must be updated manually"
     echo ""
 fi
 
-# 检查构建服务器上是否有 setu-cli
-echo "  检查 setu-cli..."
+# Check that setu-cli exists on the build server
+echo "  Checking setu-cli..."
 if ! remote_exec "$BUILD_SERVER" "test -f ${REMOTE_BIN}/setu-cli" 2>/dev/null; then
-    print_err "setu-cli 未找到，请先运行 ./build.sh"
+    print_err "setu-cli not found, please run ./build.sh first"
     exit 1
 fi
 
-# 为每个 validator 生成密钥
+# Generate a key for each validator
 PUB_KEYS=()
 for i in "${!VALIDATOR_IDS[@]}"; do
     vid="${VALIDATOR_IDS[$i]}"
     host="${SERVERS[$i]}"
     key_file="${REMOTE_KEYS}/${vid}.key"
     
-    print_step $((i+1)) ${#VALIDATOR_IDS[@]} "生成 ${vid} 密钥..."
+    print_step $((i+1)) ${#VALIDATOR_IDS[@]} "Generating key for ${vid}..."
     
-    # 在构建服务器上生成密钥
+    # Generate the key on the build server
     output=$(remote_exec "$BUILD_SERVER" "
         ${REMOTE_BIN}/setu-cli gen-key generate \
             --scheme ed25519 \
@@ -44,46 +44,46 @@ for i in "${!VALIDATOR_IDS[@]}"; do
     ")
     
     if echo "$output" | grep -q 'KEYGEN_FAILED'; then
-        print_err "密钥生成失败: ${vid}"
+        print_err "Key generation failed: ${vid}"
         exit 1
     fi
 
-    # 提取公钥
+    # Extract the public key
     pub_key=$(remote_exec "$BUILD_SERVER" "
         ${REMOTE_BIN}/setu-cli gen-key inspect ${REMOTE_KEYS}/${vid}.key 2>/dev/null \
             | grep -i 'public.*key' | head -1 | awk '{print \$NF}' \
             || echo ''
     ")
     
-    # 如果 inspect 无法提取，尝试 JSON 输出
+    # If inspect can't extract it, try the JSON output
     if [ -z "$pub_key" ]; then
         pub_key=$(echo "$output" | jq -r '.public_key // empty' 2>/dev/null || echo "")
     fi
 
     PUB_KEYS+=("$pub_key")
-    echo "    公钥: ${pub_key:0:16}..."
+    echo "    public key: ${pub_key:0:16}..."
     
-    # 分发密钥到对应服务器
+    # Distribute the key to the corresponding server
     if [ "$i" -ne 0 ]; then
-        echo "    → 分发到 ${host}"
+        echo "    → distributing to ${host}"
         remote_exec "$host" "mkdir -p ${REMOTE_KEYS}"
         remote_to_remote_copy "$BUILD_SERVER" "${key_file}" "$host" "${key_file}"
     fi
 done
 
 echo ""
-print_ok "所有密钥已生成并分发"
+print_ok "All keys generated and distributed"
 
-# 更新本地 genesis-remote.json 中的 public_key
+# Update the public_key fields in the local genesis-remote.json
 if ! command -v jq &>/dev/null; then
-    print_warn "jq 未安装，跳过 genesis-remote.json 更新"
-    echo "  请手动将以下公钥填入 genesis-remote.json:"
+    print_warn "jq not installed, skipping genesis-remote.json update"
+    echo "  Please manually fill the following public keys into genesis-remote.json:"
     for i in "${!VALIDATOR_IDS[@]}"; do
         echo "    ${VALIDATOR_IDS[$i]}: ${PUB_KEYS[$i]}"
     done
 elif [ ${#PUB_KEYS[@]} -eq ${#VALIDATOR_IDS[@]} ] && [ -n "${PUB_KEYS[0]}" ]; then
     echo ""
-    echo "  更新 genesis-remote.json 中的公钥..."
+    echo "  Updating public keys in genesis-remote.json..."
     
     local_genesis="${SCRIPT_DIR}/genesis-remote.json"
     
@@ -91,7 +91,7 @@ elif [ ${#PUB_KEYS[@]} -eq ${#VALIDATOR_IDS[@]} ] && [ -n "${PUB_KEYS[0]}" ]; th
         vid="${VALIDATOR_IDS[$i]}"
         pk="${PUB_KEYS[$i]}"
         if [ -n "$pk" ]; then
-            # 使用 jq 更新对应 validator 的 public_key
+            # Use jq to update the corresponding validator's public_key
             tmp=$(mktemp)
             jq --arg vid "$vid" --arg pk "$pk" \
                 '(.validators[] | select(.id == $vid)).public_key = $pk' \
@@ -99,8 +99,8 @@ elif [ ${#PUB_KEYS[@]} -eq ${#VALIDATOR_IDS[@]} ] && [ -n "${PUB_KEYS[0]}" ]; th
         fi
     done
     
-    print_ok "genesis-remote.json 已更新"
-    echo "  请重新运行 ./deploy.sh 以分发更新后的配置"
+    print_ok "genesis-remote.json updated"
+    echo "  Please re-run ./deploy.sh to distribute the updated config"
 else
-    print_warn "部分公钥获取失败，请手动更新 genesis-remote.json"
+    print_warn "Failed to obtain some public keys; please update genesis-remote.json manually"
 fi

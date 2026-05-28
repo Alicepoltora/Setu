@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 停止 Validator + Solver 节点
-# 用法: ./stop.sh [1|2|3|all]
+# Stop validator + solver nodes
+# Usage: ./stop.sh [1|2|3|all]
 # ============================================================================
 set -e
 
@@ -15,11 +15,11 @@ stop_validator() {
     local host="${SERVERS[$idx]}"
     local vid="${VALIDATOR_IDS[$idx]}"
 
-    echo "  停止 ${vid} (${host})..."
+    echo "  Stopping ${vid} (${host})..."
 
     local output
     output=$(remote_exec "$host" "
-        # 先停止 Solver
+        # Stop Solver first
         SPID=\$(pidof setu-solver 2>/dev/null || true)
         if [ -n \"\$SPID\" ]; then
             kill \$SPID 2>/dev/null || true
@@ -27,7 +27,7 @@ stop_validator() {
             kill -9 \$SPID 2>/dev/null || true
             echo 'SOLVER_STOPPED'
         fi
-        # 再停止 Validator
+        # Then stop Validator
         VPID=\$(pidof setu-validator 2>/dev/null || true)
         if [ -n \"\$VPID\" ]; then
             kill \$VPID 2>/dev/null || true
@@ -38,22 +38,22 @@ stop_validator() {
             echo 'NOT_RUNNING'
         fi
     " 2>&1) || {
-        print_err "${vid}: SSH 连接失败 (${host})"
+        print_err "${vid}: SSH connection failed (${host})"
         return 1
     }
     
     if echo "$output" | grep -q 'SOLVER_STOPPED'; then
-        print_ok "${vid} solver 已停止"
+        print_ok "${vid} solver stopped"
     fi
     if echo "$output" | grep -q 'STOPPED'; then
-        print_ok "${vid} validator 已停止"
+        print_ok "${vid} validator stopped"
     elif echo "$output" | grep -q 'NOT_RUNNING'; then
-        echo "    ${vid} 未在运行"
+        echo "    ${vid} is not running"
     fi
 }
 
-# ── 主逻辑 ──────────────────────────────────────────────────────────────────
-print_header "停止 Setu Validator + Solver 集群"
+# ── Main logic ──────────────────────────────────────────────────────────────────
+print_header "Stop Setu Validator + Solver Cluster"
 
 case "$TARGET" in
     1) stop_validator 0 ;;
@@ -65,10 +65,10 @@ case "$TARGET" in
         done
         ;;
     *)
-        echo "用法: $0 [1|2|3|all]"
+        echo "Usage: $0 [1|2|3|all]"
         exit 1
         ;;
 esac
 
 echo ""
-print_ok "完成"
+print_ok "Done"

@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 清理: 停止进程 + 删除数据 + 删除日志
-# 用法: ./clean.sh [1|2|3|all] [--keep-binary] [--keep-keys]
+# Cleanup: stop processes + delete data + delete logs
+# Usage: ./clean.sh [1|2|3|all] [--keep-binary] [--keep-keys]
 # ============================================================================
 set -e
 
@@ -26,9 +26,9 @@ clean_server() {
     local host="${SERVERS[$idx]}"
     local vid="${VALIDATOR_IDS[$idx]}"
 
-    echo "  清理 ${vid} (${host})..."
+    echo "  Cleaning ${vid} (${host})..."
 
-    # 停止进程
+    # Stop processes
     remote_exec "$host" "
         VPID=\$(pidof setu-validator 2>/dev/null || true)
         SPID=\$(pidof setu-solver 2>/dev/null || true)
@@ -39,24 +39,24 @@ clean_server() {
         [ -n \"\$VPID\" ] && kill -9 \$VPID 2>/dev/null || true
     "
 
-    # 删除数据
+    # Delete data
     remote_exec "$host" "rm -rf ${REMOTE_DATA}/db/* ${REMOTE_LOGS}/*.log"
-    echo "    ✓ 数据 + 日志已删除"
+    echo "    ✓ data + logs deleted"
 
     if [ "$KEEP_BIN" = false ]; then
         remote_exec "$host" "rm -f ${REMOTE_BIN}/setu-*"
-        echo "    ✓ 二进制已删除"
+        echo "    ✓ binaries deleted"
     fi
 
     if [ "$KEEP_KEYS" = false ]; then
         remote_exec "$host" "rm -f ${REMOTE_KEYS}/*.key"
-        echo "    ✓ 密钥文件已删除"
+        echo "    ✓ key files deleted"
     fi
 }
 
-print_header "清理 Setu 集群数据"
+print_header "Cleaning Setu Cluster Data"
 
-echo "  选项: keep_binary=${KEEP_BIN}, keep_keys=${KEEP_KEYS}"
+echo "  Options: keep_binary=${KEEP_BIN}, keep_keys=${KEEP_KEYS}"
 echo ""
 
 case "$TARGET" in
@@ -69,10 +69,10 @@ case "$TARGET" in
         done
         ;;
     *)
-        echo "用法: $0 [1|2|3|all] [--keep-binary] [--keep-keys]"
+        echo "Usage: $0 [1|2|3|all] [--keep-binary] [--keep-keys]"
         exit 1
         ;;
 esac
 
 echo ""
-print_ok "清理完成"
+print_ok "Cleanup complete"
