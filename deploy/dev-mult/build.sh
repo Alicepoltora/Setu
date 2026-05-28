@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 编译 + 分发: 同步源码到构建服务器, cargo build, 分发二进制到所有节点
-# 用法: ./build.sh [--skip-sync] [--skip-distribute]
+# Build + distribute: sync source to build server, cargo build, distribute binaries to all nodes
+# Usage: ./build.sh [--skip-sync] [--skip-distribute]
 # ============================================================================
 set -e
 
@@ -15,7 +15,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-sync)       SKIP_SYNC=true; shift ;;
         --skip-distribute) SKIP_DIST=true; shift ;;
-        *) echo "未知参数: $1"; exit 1 ;;
+        *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
@@ -50,11 +50,11 @@ copy_remote_artifact_atomically() {
             fi
         fi
 
-        print_warn "${host}: 分发 ${artifact} 失败，重试 ${attempt}/5"
+        print_warn "${host}: failed to distribute ${artifact}, retry ${attempt}/5"
         sleep 5
     done
 
-    print_err "${host}: 分发 ${artifact} 失败"
+    print_err "${host}: failed to distribute ${artifact}"
     return 1
 }
 
@@ -90,37 +90,37 @@ distribute_bundle_via_rsync() {
         "; then
             return 0
         fi
-        print_warn "${host}: rsync 分发失败，重试 ${attempt}/3"
+        print_warn "${host}: rsync distribution failed, retry ${attempt}/3"
         sleep 5
     done
     return 1
 }
 
-print_header "Setu 构建 & 分发"
-echo "  源码指纹: ${LOCAL_SOURCE_FINGERPRINT}"
+print_header "Setu Build & Distribute"
+echo "  Source fingerprint: ${LOCAL_SOURCE_FINGERPRINT}"
 echo "  Git commit: ${LOCAL_GIT_COMMIT}"
 if [ -n "$LOCAL_FEATURE_FLAGS" ]; then
     echo "  Feature flags: ${LOCAL_FEATURE_FLAGS}"
 fi
 
-# ── Step 1: 同步源码到构建服务器 ────────────────────────────────────────────
+# ── Step 1: Sync source to build server ──────────────────────────────────
 if [ "$SKIP_SYNC" = false ]; then
-    print_step 1 5 "同步源码到构建服务器 (${BUILD_SERVER})..."
+    print_step 1 5 "Syncing source to build server (${BUILD_SERVER})..."
     
-    # 确保远程源码目录存在
+    # Ensure remote source directory exists
     remote_exec "$BUILD_SERVER" "mkdir -p ${REMOTE_SRC}"
     
     remote_sync "${PROJECT_DIR}/" "$BUILD_SERVER" "${REMOTE_SRC}/"
-    print_ok "源码同步完成"
+    print_ok "Source sync complete"
 else
-    print_step 1 5 "跳过源码同步"
+    print_step 1 5 "Skipping source sync"
 fi
 
-# ── Step 2: 编译 Move stdlib 字节码 ─────────────────────────────────────────
+# ── Step 2: Compile Move stdlib bytecode ───────────────────────────────
 # The validator binary embeds setu-framework/compiled/*.mv at compile time.
 # The build server regenerates these files from setu-framework/sources/ before
 # cargo build so the remote binary always carries the current stdlib bytecode.
-print_step 2 5 "编译 Move stdlib (.mv 字节码)..."
+print_step 2 5 "Compiling Move stdlib (.mv bytecode)..."
 remote_exec "$BUILD_SERVER" "
     set -eo pipefail
     source \"\$HOME/.cargo/env\" 2>/dev/null || true
@@ -148,12 +148,12 @@ remote_exec "$BUILD_SERVER" "
     fi
     echo \"  ✓ \$count stdlib modules compiled\"
 "
-print_ok "stdlib 编译完成"
+print_ok "stdlib compilation complete"
 
-# ── Step 3: 远程编译 ────────────────────────────────────────────────────────
-print_step 3 5 "在构建服务器上编译 (release)..."
-echo "  构建目标: setu-validator, setu-solver, setu-cli, setu-benchmark"
-echo "  (首次编译可能需要 20-40 分钟，请耐心等待...)"
+# ── Step 3: Remote compile ────────────────────────────────────────────────
+print_step 3 5 "Compiling on build server (release)..."
+echo "  Build targets: setu-validator, setu-solver, setu-cli, setu-benchmark"
+echo "  (First-time build may take 20-40 minutes, please be patient...)"
 
 if [ -n "$LOCAL_FEATURE_FLAGS" ]; then
     echo "  [build] forwarding feature flags to remote: ${LOCAL_FEATURE_FLAGS}"
@@ -184,10 +184,10 @@ remote_exec "$BUILD_SERVER" "
         -p setu-benchmark \\
         2>&1
 "
-print_ok "编译完成"
+print_ok "Compilation complete"
 
-# ── Step 4: 复制二进制到 bin 目录 ───────────────────────────────────────────
-print_step 4 5 "安装二进制到构建服务器..."
+# ── Step 4: Copy binaries to bin directory ───────────────────────────────
+print_step 4 5 "Installing binaries on build server..."
 remote_exec "$BUILD_SERVER" "
     set -eo pipefail
     install_bin() {
@@ -214,22 +214,22 @@ EOF
     ls -lh ${REMOTE_BIN}/
     cat ${REMOTE_BIN}/setu-build-info.env
 "
-print_ok "构建服务器 (${BUILD_SERVER}) 二进制就绪"
+print_ok "Build server (${BUILD_SERVER}) binaries ready"
 
-# ── Step 5: 分发到其他服务器 ────────────────────────────────────────────────
+# ── Step 5: Distribute to other servers ─────────────────────────────────────
 if [ "$SKIP_DIST" = false ]; then
-    print_step 5 5 "分发二进制到其他服务器..."
+    print_step 5 5 "Distributing binaries to other servers..."
     for i in "${!SERVERS[@]}"; do
         if [ "$i" -eq 0 ]; then
-            continue  # 跳过构建服务器自身
+            continue  # Skip the build server itself
         fi
         local_host="${SERVERS[$i]}"
         echo "    → ${VALIDATOR_IDS[$i]} (${local_host})"
 
-        # 确保远程目录存在
+        # Ensure remote directory exists
         remote_exec "$local_host" "mkdir -p ${REMOTE_BIN}"
 
-        # 收集本次实际存在的 artifact (可选二进制可能缺失)
+        # Collect artifacts that actually exist (optional binaries may be missing)
         bundle=(setu-validator setu-solver setu-build-info.env)
         for opt in setu-cli setu-benchmark; do
             if remote_exec "$BUILD_SERVER" "[ -f '${REMOTE_BIN}/${opt}' ]" 2>/dev/null; then
@@ -237,16 +237,16 @@ if [ "$SKIP_DIST" = false ]; then
             fi
         done
 
-        # 首选: 单次 rsync 分发所有 artifact (1 个 SSH 连接 vs N 个)
+        # Preferred: distribute all artifacts in a single rsync (1 SSH connection vs N)
         if distribute_bundle_via_rsync "$local_host" "${bundle[@]}"; then
-            print_ok "${local_host}: rsync 分发 ${#bundle[@]} 个 artifact 成功"
+            print_ok "${local_host}: rsync distributed ${#bundle[@]} artifact(s) successfully"
         else
-            print_warn "${local_host}: rsync 不可用或失败，退回逐文件 scp"
-            # 关键二进制: 失败则报错
+            print_warn "${local_host}: rsync unavailable or failed, falling back to per-file scp"
+            # Critical binaries: error if they fail
             for bin_name in setu-validator setu-solver; do
                 copy_remote_artifact_atomically "$local_host" "$bin_name" 1
             done
-            # 可选二进制: 失败时静默跳过
+            # Optional binaries: silently skip on failure
             for bin_name in setu-cli setu-benchmark; do
                 copy_remote_artifact_atomically "$local_host" "$bin_name" 1 2>/dev/null || true
             done
@@ -255,13 +255,13 @@ if [ "$SKIP_DIST" = false ]; then
 
         remote_exec "$local_host" "chmod +x ${REMOTE_BIN}/setu-validator ${REMOTE_BIN}/setu-solver 2>/dev/null; chmod +x ${REMOTE_BIN}/setu-cli ${REMOTE_BIN}/setu-benchmark 2>/dev/null; true"
     done
-    print_ok "二进制分发完成"
+    print_ok "Binary distribution complete"
 else
-    print_step 5 5 "跳过二进制分发"
+    print_step 5 5 "Skipping binary distribution"
 fi
 
 echo ""
-print_ok "构建完成!"
+print_ok "Build complete!"
 echo ""
-echo "  二进制位置: ${REMOTE_BIN}/"
-echo "  下一步: ./deploy.sh   # 分发配置并启动"
+echo "  Binary location: ${REMOTE_BIN}/"
+echo "  Next step: ./deploy.sh   # Distribute config and start"

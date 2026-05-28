@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 检查所有节点状态: 进程、HTTP 健康、P2P 端口、磁盘空间
-# 用法: ./status.sh [--verbose]
+# Check status of all nodes: processes, HTTP health, P2P port, disk space
+# Usage: ./status.sh [--verbose]
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,53 +9,53 @@ source "${SCRIPT_DIR}/config.sh"
 
 VERBOSE="${1:-}"
 
-print_header "Setu 集群状态"
+print_header "Setu Cluster Status"
 
 printf "  %-14s %-18s %-10s %-10s %-10s %-10s %s\n" \
-    "节点" "IP" "Validator" "Solver" "HTTP" "P2P" "备注"
+    "Node" "IP" "Validator" "Solver" "HTTP" "P2P" "Notes"
 echo "  ────────────── ────────────────── ────────── ────────── ────────── ────────── ──────"
 
 for i in "${!SERVERS[@]}"; do
     host="${SERVERS[$i]}"
     vid="${VALIDATOR_IDS[$i]}"
     
-    # 检查 Validator 进程
+    # Check Validator process
     proc_status="✗"
     if remote_exec "$host" "pgrep -f setu-validator" &>/dev/null; then
-        proc_status="✓ 运行"
+        proc_status="✓ running"
     else
-        proc_status="✗ 停止"
+        proc_status="✗ stopped"
     fi
 
-    # 检查 Solver 进程
+    # Check Solver process
     solver_status="✗"
     if remote_exec "$host" "pgrep -f setu-solver" &>/dev/null; then
-        solver_status="✓ 运行"
+        solver_status="✓ running"
     else
-        solver_status="✗ 停止"
+        solver_status="✗ stopped"
     fi
 
-    # 检查 HTTP 健康
+    # Check HTTP health
     http_status="✗"
     health_resp=$(curl -sf --connect-timeout 3 "http://${host}:${HTTP_PORT}/api/v1/health" 2>/dev/null || echo "")
     if [ -n "$health_resp" ]; then
-        http_status="✓ 健康"
+        http_status="✓ healthy"
     else
-        http_status="✗ 无响应"
+        http_status="✗ no resp"
     fi
     
-    # 检查 P2P 端口 (UDP/QUIC)
+    # Check P2P port (UDP/QUIC)
     p2p_status="?"
     if remote_exec "$host" "ss -ulnp | grep -q ':${P2P_PORT}'" 2>/dev/null; then
-        p2p_status="✓ 监听"
+        p2p_status="✓ listen"
     else
-        p2p_status="✗ 未监"
+        p2p_status="✗ not lstn"
     fi
     
-    # 备注
+    # note
     note=""
     if [ "$i" -eq 0 ]; then
-        note="(构建服务器)"
+        note="(build server)"
     fi
     
     printf "  %-14s %-18s %-10s %-10s %-10s %-10s %s\n" \
@@ -64,38 +64,38 @@ done
 
 if [ "$VERBOSE" = "--verbose" ] || [ "$VERBOSE" = "-v" ]; then
     echo ""
-    echo "━━━ 详细信息 ━━━"
+    echo "━━━ Details ━━━"
     for i in "${!SERVERS[@]}"; do
         host="${SERVERS[$i]}"
         vid="${VALIDATOR_IDS[$i]}"
         
         echo ""
-        echo "  【${vid}】${host}"
+        echo "  [${vid}] ${host}"
         
-        # 进程信息
-        echo "  进程:"
-        remote_exec "$host" "ps aux | grep -E 'setu-(validator|solver)' | grep -v grep || echo '    (无运行进程)'" 2>/dev/null
+        # Process info
+        echo "  Processes:"
+        remote_exec "$host" "ps aux | grep -E 'setu-(validator|solver)' | grep -v grep || echo '    (no running processes)'" 2>/dev/null
 
-        # Solver 日志
-        echo "  Solver 日志:"
-        remote_exec "$host" "tail -3 ${REMOTE_LOGS}/solver.log 2>/dev/null || echo '    (无日志)'" 2>/dev/null
+        # Solver logs
+        echo "  Solver logs:"
+        remote_exec "$host" "tail -3 ${REMOTE_LOGS}/solver.log 2>/dev/null || echo '    (no logs)'" 2>/dev/null
 
-        # 磁盘空间
-        echo "  磁盘:"
-        remote_exec "$host" "df -h ${REMOTE_BASE} 2>/dev/null | tail -1 || echo '    (未知)'" 2>/dev/null
+        # Disk space
+        echo "  Disk:"
+        remote_exec "$host" "df -h ${REMOTE_BASE} 2>/dev/null | tail -1 || echo '    (unknown)'" 2>/dev/null
 
-        # RocksDB 大小
-        echo "  数据:"
-        remote_exec "$host" "du -sh ${REMOTE_DATA}/db 2>/dev/null || echo '    (无数据)'" 2>/dev/null
+        # RocksDB size
+        echo "  Data:"
+        remote_exec "$host" "du -sh ${REMOTE_DATA}/db 2>/dev/null || echo '    (no data)'" 2>/dev/null
         
-        # 日志最后几行
-        echo "  最近日志:"
-        remote_exec "$host" "tail -3 ${REMOTE_LOGS}/validator.log 2>/dev/null || echo '    (无日志)'" 2>/dev/null
+        # Last lines of logs
+        echo "  Recent logs:"
+        remote_exec "$host" "tail -3 ${REMOTE_LOGS}/validator.log 2>/dev/null || echo '    (no logs)'" 2>/dev/null
         
-        # 健康详情
+        # Health details
         health=$(curl -sf --connect-timeout 3 "http://${host}:${HTTP_PORT}/api/v1/health" 2>/dev/null || echo "")
         if [ -n "$health" ]; then
-            echo "  健康响应: ${health}"
+            echo "  health response: ${health}"
         fi
     done
 fi
