@@ -29,14 +29,14 @@
 | 3100 | TCP | Loki | 仅 ops 本机 |
 | 443 | TCP | nginx (Grafana TLS) | 公网（可选） |
 
-主机名约定（真实 IP 在动手前填入 `docs/v1/release/inventory.env`，公开文档用占位符）：
+主机名约定（与 `docs/v1/release/inventory.env` 保持一致）：
 
 ```
 testnet-val-1  <VAL1_IP>
 testnet-val-2  <VAL2_IP>
 testnet-val-3  <VAL3_IP>
-testnet-ops    <OPS_IP>          # 同时承担 gateway、builder、monitor
-testnet.setu.org → <OPS_IP>      # 公网入口域名（A 记录，TTL 600）
+testnet-ops    <OPS_IP>        # 同时承担 gateway、builder、monitor
+testnet.setu.org → <OPS_IP>  # 公网入口域名（A 记录，TTL 600）
 ```
 
 维护 IP 白名单：在动手前确认并记录。本文用 `<MAINT_IP>` 占位。
@@ -73,7 +73,7 @@ testnet.setu.org → <OPS_IP>      # 公网入口域名（A 记录，TTL 600）
 产出文件：`deploy/testnet/inventory.env`（手工维护，不入仓库或仅入仓库示例版）
 
 ```bash
-# 节点（真实 IP 填到 inventory.env，本示例为占位符）
+# 节点
 VAL_HOSTS=(testnet-val-1 testnet-val-2 testnet-val-3)
 VAL_IPS=(<VAL1_IP> <VAL2_IP> <VAL3_IP>)
 OPS_HOST=testnet-ops
@@ -85,8 +85,10 @@ HTTP_PORT=8080
 P2P_PORT=9000
 SOLVER_PORT=9001
 
-# 维护
-MAINT_IPS=(<MAINT_IP_1> <MAINT_IP_2>)
+# 维护：分层 SSH 白名单（见 §8.1）
+#   ops 22 对全网开放（key + fail2ban 防护），val 22 仅放行 ops 跳板 + 运维者 IP 段
+MAINT_IPS_OPS=("0.0.0.0/0")
+MAINT_IPS_VAL=("$OPS_IP/32" "<OPERATOR_HOME_CIDR>")   # 例 "117.173.0.0/16"
 SETU_USER=setu
 SETU_GROUP=setu
 
@@ -259,25 +261,36 @@ done
 
 ### 8.1 UFW 规则（必须先允许 SSH 再 enable）
 
-```bash
-for ip in "${MAINT_IPS[@]}"; do
-  sudo ufw allow from "$ip" to any port 22 proto tcp
-done
+**分层白名单策略**（与 `inventory.env` 中 `MAINT_IPS_OPS` / `MAINT_IPS_VAL` 对应）：
 
-# validator 节点：
+- **ops**（跳板 / 公网入口）：22 默认对全网开放（`0.0.0.0/0`），靠 key-only + fail2ban 防护。原因：ops 本身要对外提供 80/443，22 多开不显著扩大攻击面；代价是运维便利性最高。
+- **val-1/2/3**（共识节点）：22 仅放行 ops IP + 运维者家宽出口段（兑底）。主路径是 ops 跳板；ops 故障时仍可直连。
+
+```bash
+# === 22 端口 —— 分层白名单 ===
+if [ "$HOST" = "$OPS_HOST" ]; then
+  for ip in "${MAINT_IPS_OPS[@]}"; do
+    sudo ufw allow from "$ip" to any port 22 proto tcp
+  done
+else
+  for ip in "${MAINT_IPS_VAL[@]}"; do
+    sudo ufw allow from "$ip" to any port 22 proto tcp
+  done
+fi
+
+# === validator 节点：P2P 9000、HTTP 8080 仅放 gateway、监控拓取 9100/9080 仅放 ops ===
 for ip in "${VAL_IPS[@]}" "$OPS_IP"; do
   sudo ufw allow from "$ip" to any port 9000 proto tcp
   sudo ufw allow from "$ip" to any port 9000 proto udp
 done
-# HTTP 8080 仅放行 gateway IP（默认 OPS_IP），公网入口由 gateway 443 反代 —— 参见 testnet-anti-spam-plan-20260529.md 阶段 1
 sudo ufw allow from "$OPS_IP" to any port 8080 proto tcp
-for ip in "${MAINT_IPS[@]}"; do
+for ip in "${MAINT_IPS_VAL[@]}"; do
   sudo ufw allow from "$ip" to any port 8080 proto tcp   # 调试用
 done
 sudo ufw allow from "$OPS_IP" to any port 9100 proto tcp
 sudo ufw allow from "$OPS_IP" to any port 9080 proto tcp
 
-# ops/gateway 节点：公网 443（Grafana + Setu 网关） + 80（certbot）
+# === ops/gateway 节点：公网 443（Grafana + Setu 网关） + 80（certbot）===
 sudo ufw allow 443/tcp
 sudo ufw allow 80/tcp
 
@@ -304,7 +317,28 @@ sudo systemctl restart ssh
 
 **强制验证**：另开一个终端 `ssh -i key maint@N "echo still-ok"`，**成功后才能关闭原会话**。
 
-### 8.3 journald 限额
+### 8.3 fail2ban（SSH 暴力扫描防护）
+
+```bash
+sudo apt-get install -y fail2ban
+sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null <<'EOF'
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+backend  = systemd
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+EOF
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status sshd
+```
+
+- ops（22 对公网开放）**必装**；val（仅白名单 IP）也装上作双保险。
+- `phase04-ssh-ufw.sh` 的 4.5b 已自动完成上述动作。
+
+### 8.4 journald 限额
 
 ```bash
 sudo tee /etc/systemd/journald.conf.d/setu.conf >/dev/null <<'EOF'
@@ -320,7 +354,7 @@ sudo systemctl restart systemd-journald
 
 ## ✅ CHECKPOINT 1 — 安全基线建立
 
-进入 Phase 6 前必须满足：4 台均为 key-only SSH、UFW 已 enable 且 SSH 22 在白名单中、journald 已限额、chrony 同步正常。
+进入 Phase 6 前必须满足：4 台均为 key-only SSH、UFW 已 enable 且 SSH 22 在白名单中（ops = `MAINT_IPS_OPS`，val = `MAINT_IPS_VAL`）、fail2ban 已启动、journald 已限额、chrony 同步正常。
 
 ---
 
@@ -545,7 +579,7 @@ docker compose version
 
 ### 15.1 在 ops 上 clone 仓库（如未 clone）
 
-固定使用公开的 `testnet/v1` 分支作为部署源（已包含本 runbook 与 `docs/v1/release/` 全套 phase 脚本）：
+固定使用公开镜像的 `testnet/v1` 分支作为部署源（已包含本 runbook 与 `docs/v1/release/` 全套 phase 脚本）：
 
 ```bash
 sudo install -d -o $USER -g $USER /opt/setu-src
@@ -553,7 +587,7 @@ git clone --branch testnet/v1 --depth 1 https://github.com/ivan-xin/Setu /opt/se
 cd /opt/setu-src/Setu
 ```
 
-后续若需更新到 `testnet/v1` 的新 commit，`git fetch origin testnet/v1 && git reset --hard origin/testnet/v1`（仅在 ops 上执行；validator 不 clone 源码）。
+后续若需更新到 `testnet/v1` 的新 commit：`git fetch origin testnet/v1 && git reset --hard origin/testnet/v1`（仅在 ops 上执行；validator 不 clone 源码）。
 
 ### 15.2 keygen CLI 子命令
 
@@ -1068,6 +1102,10 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 25. Phase 22 — Prometheus 抓取目标接入
 
+> 下面 `prometheus.yml` 使用 hostname（`testnet-val-1` 等）作为示意；**实际部署请运行**
+> `bash docs/v1/release/phase13-monitoring.sh`，该脚本会根据 `inventory.env` 中的真实 IP
+> 自动渲染 targets，无需手工编辑。
+
 `/opt/monitor/prometheus/prometheus.yml`：
 
 ```yaml
@@ -1151,13 +1189,20 @@ curl -s http://127.0.0.1:9090/api/v1/targets | jq '.data.activeTargets[].health'
 
 ## 27. Phase 24 — 定时任务（cron / systemd timer）
 
-### 27.1 每日 preflight（ops 上）
+### 27.1 每日 infra 健康巡检（ops 上）
+
+`remote_infra_matrix.sh` 会从 ops 远程 SSH 到所有 host 收集 CPU / 内存 / 磁盘 / systemd 状态，输出对比矩阵：
 
 ```bash
-sudo tee /etc/cron.d/setu-preflight >/dev/null <<'EOF'
-0 6 * * * setu /opt/setu-src/Setu/docs/testnet/testnet-infra/scripts/preflight.sh >> /var/log/setu-preflight.log 2>&1
+sudo tee /etc/cron.d/setu-infra-matrix >/dev/null <<'EOF'
+0 6 * * * setu cd /opt/setu-src/Setu && bash docs/testnet/testnet-infra/scripts/remote_infra_matrix.sh >> /var/log/setu-infra-matrix.log 2>&1
 EOF
 ```
+
+> 公开镜像 (`origin/testnet/v1`) 未携带 `docs/testnet/`；如果用公开版部署，请改为调用 `docs/v1/release/health_probe.sh`：
+> ```bash
+> 0 6 * * * setu bash /opt/setu-src/Setu/docs/v1/release/health_probe.sh >> /var/log/setu-health.log 2>&1
+> ```
 
 ### 27.2 每周 RocksDB 备份（**逐台串行**，保留 quorum）
 
