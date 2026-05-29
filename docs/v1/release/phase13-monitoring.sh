@@ -187,7 +187,7 @@ echo "$DS" | mssh "$GATEWAY" "sudo tee ${MONITOR_DIR}/grafana/provisioning/datas
 
 # ── 3. 启动 ────────────────────────────────────────────────────────────────────
 log_info "[8] docker compose up -d"
-mssh "$GATEWAY" "cd ${MONITOR_DIR} && sudo docker compose pull && sudo docker compose up -d"
+mssh "$GATEWAY" "cd ${MONITOR_DIR} && sudo docker compose pull && sudo docker compose up -d --remove-orphans && sudo docker compose restart"
 mssh "$GATEWAY" "cd ${MONITOR_DIR} && sudo docker compose ps"
 
 # ── 4. 自检（仅看本机回环端口）─────────────────────────────────────────────────
