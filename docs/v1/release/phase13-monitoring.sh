@@ -86,6 +86,15 @@ services:
     ports:
       - "127.0.0.1:9115:9115"
 
+  node_exporter_ops:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+
 volumes:
   prom-data:
   grafana-data:
@@ -110,7 +119,7 @@ scrape_configs:
   - job_name: node
     static_configs:
       - targets:
-${val_targets_node}          - ${ops_ip}:9100
+${val_targets_node}          - node_exporter_ops:9100
 
   - job_name: setu-health-json
     metrics_path: /probe
