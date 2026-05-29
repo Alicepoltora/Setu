@@ -49,8 +49,8 @@ for HOST in "${VAL_ALIASES[@]}"; do
         exit 1
     fi
 
-    log_info "[$HOST] --version 自检..."
-    sssh "$HOST" "$REMOTE_DIR/setu-validator --version"
+    log_info "[$HOST] ELF / 二进制健全性自检（setu-validator 未实现 clap，不能用 --version）..."
+    sssh "$HOST" "file $REMOTE_DIR/setu-validator | grep -q ELF && file $REMOTE_DIR/setu-solver | grep -q ELF && file $REMOTE_DIR/setu-cli | grep -q ELF"
 
     # 校验通过才切 symlink
     log_info "[$HOST] 切换 current symlink（ln -sfnT）..."
