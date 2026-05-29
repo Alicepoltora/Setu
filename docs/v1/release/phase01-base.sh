@@ -15,7 +15,8 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq \
   ca-certificates curl wget gnupg \
   jq rsync unzip git \
-  htop lsof ufw logrotate
+  htop lsof ufw logrotate \
+  prometheus-node-exporter
 echo "[remote] base packages installed"
 REMOTE
 

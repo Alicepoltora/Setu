@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# phase13-monitoring.sh — 在 ops/gateway 节点起监控栈（Prometheus + Loki + Grafana + json/blackbox exporter）
+# phase13-monitoring.sh — 在 ops/gateway 节点起监控栈（Prometheus + Grafana + json/blackbox exporter）
+# 注意：Loki 暂未启用 —— 当前没有日志 shipper（promtail/vector），起空 Loki 没意义。
+#       需要日志聚合时，先在 validator 装 promtail，再恢复脚本里 Loki 相关段。
 # 对应 runbook §23（Phase 20）+ §25（Phase 22 抓取目标）。
 # Grafana dashboard / 告警规则不在脚本范围 —— 见 runbook §26。
 #
@@ -27,13 +29,14 @@ for alias in "${VAL_ALIASES[@]}"; do
     val_targets_health+="          - http://${ip}:${HTTP_PORT}/api/v1/health"$'\n'
 done
 ops_ip=$(resolve_host "$GATEWAY")
+# 自检探针用第一台 validator 的 IP（ops 自己不跑 validator）
+first_val_ip=$(resolve_host "${VAL_ALIASES[0]}")
 
 # ── 2. 在 gateway 上落盘所有配置 ───────────────────────────────────────────────
 log_info "[1] 创建 ${MONITOR_DIR} 目录结构"
 mssh "$GATEWAY" "sudo install -d -o root -g root -m 755 \
     ${MONITOR_DIR} \
     ${MONITOR_DIR}/prometheus \
-    ${MONITOR_DIR}/loki \
     ${MONITOR_DIR}/json_exporter \
     ${MONITOR_DIR}/grafana/provisioning/datasources \
     ${MONITOR_DIR}/grafana/provisioning/dashboards"
@@ -54,15 +57,8 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
 
-  loki:
-    image: grafana/loki:3.0.0
-    restart: unless-stopped
-    command: -config.file=/etc/loki/loki-config.yml
-    volumes:
-      - ./loki:/etc/loki
-      - loki-data:/loki
-    ports:
-      - "127.0.0.1:3100:3100"
+  # NOTE: Loki 暂未启用 —— 当前阶段没有 promtail / vector 等日志 shipper，
+  # 起空 Loki 只是占资源。需要日志聚合时，在 validator 上加 promtail 再恢复本段。
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -92,7 +88,6 @@ services:
 
 volumes:
   prom-data:
-  loki-data:
   grafana-data:
 EOF
 )
@@ -166,48 +161,9 @@ EOF
 )
 echo "$JSONX" | mssh "$GATEWAY" "sudo tee ${MONITOR_DIR}/json_exporter/config.yml >/dev/null"
 
-log_info "[6] 写 loki-config.yml（filesystem + 30 天保留）"
-LOKI=$(cat <<'EOF'
-auth_enabled: false
-server:
-  http_listen_port: 3100
+# [6] Loki 配置已移除（无 shipper 时不启动 Loki 服务）
 
-common:
-  path_prefix: /loki
-  storage:
-    filesystem:
-      chunks_directory: /loki/chunks
-      rules_directory: /loki/rules
-  replication_factor: 1
-  ring:
-    instance_addr: 127.0.0.1
-    kvstore:
-      store: inmemory
-
-schema_config:
-  configs:
-    - from: 2024-01-01
-      store: tsdb
-      object_store: filesystem
-      schema: v13
-      index:
-        prefix: index_
-        period: 24h
-
-limits_config:
-  retention_period: 720h
-
-compactor:
-  working_directory: /loki/compactor
-  compaction_interval: 10m
-  retention_enabled: true
-  retention_delete_delay: 2h
-  delete_request_store: filesystem
-EOF
-)
-echo "$LOKI" | mssh "$GATEWAY" "sudo tee ${MONITOR_DIR}/loki/loki-config.yml >/dev/null"
-
-log_info "[7] 写 grafana datasource provisioning（Prometheus + Loki）"
+log_info "[7] 写 grafana datasource provisioning（Prometheus only）"
 DS=$(cat <<'EOF'
 apiVersion: 1
 datasources:
@@ -216,10 +172,6 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
-  - name: Loki
-    type: loki
-    access: proxy
-    url: http://loki:3100
 EOF
 )
 echo "$DS" | mssh "$GATEWAY" "sudo tee ${MONITOR_DIR}/grafana/provisioning/datasources/setu.yml >/dev/null"
@@ -235,9 +187,8 @@ sleep 30
 fail=0
 for url in \
     "http://127.0.0.1:9090/-/ready" \
-    "http://127.0.0.1:3100/ready" \
     "http://127.0.0.1:3000/api/health" \
-    "http://127.0.0.1:7979/probe?module=setu_health&target=http://${ops_ip}:${HTTP_PORT}/api/v1/health"
+    "http://127.0.0.1:7979/probe?module=setu_health&target=http://${first_val_ip}:${HTTP_PORT}/api/v1/health"
 do
     if mssh "$GATEWAY" "curl -sf --max-time 5 '$url' >/dev/null"; then
         log_ok "  $url"

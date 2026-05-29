@@ -42,4 +42,15 @@ rustup show
 rustc --version
 cargo --version
 
+# ── Docker + compose（仅 ops 需要，用于 phase13 监控栈）─────────────────────
+if ! command -v docker >/dev/null; then
+    log_info "安装 docker.io + docker-compose-v2..."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      docker.io docker-compose-v2
+    sudo systemctl enable --now docker
+fi
+docker --version
+docker compose version
+
 log_ok "Phase 6 完成。Rust: $(rustc --version)"
+

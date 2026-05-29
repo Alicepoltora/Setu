@@ -24,6 +24,7 @@
 | `phase10-distribute-config.sh` | Phase 10 分发 genesis+key | ops→所有 validator | — |
 | `phase11-systemd-start.sh` | Phase 11 systemd+启动 | ops→所有 validator（串行） | **是** |
 | `phase12-verify.sh` | Phase 12 验收+监控 | ops 本机 | — |
+| `phase13-monitoring.sh` | Phase 13 监控栈（可选） | ops 本机 + docker compose | — |
 | `health_probe.sh` | 监控（cron 调用） | ops 本机 | — |
 | `rollback.sh <host> <release_id>` | 回滚 | ops→单台 validator | — |
 
@@ -105,6 +106,12 @@ bash phase11-systemd-start.sh    # 内部已串行启动
 
 # === 阶段 F：验收 ===
 bash phase12-verify.sh
+
+# === 阶段 G（可选）：监控栈 ===
+# 前置：phase06 已在 ops 装上 docker + compose；phase01 已在 4 台装上 node_exporter。
+# Loki 暂未启用（无日志 shipper）。详见脚本开头注释。
+read -rsp 'grafana admin pw: ' GRAFANA_ADMIN_PASSWORD; echo; export GRAFANA_ADMIN_PASSWORD
+bash phase13-monitoring.sh
 ```
 
 ---
