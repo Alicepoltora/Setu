@@ -66,34 +66,69 @@ log_info "查看日志：tail -f /var/log/setu-health.log"
 
 # ── 3. BUG-010 闭环 tracing 计数器（V1 ACCEPT 硬性要求）─────────────────────
 # 来源：docs/release-doc/test-v1-inner/03-known-internal-bugs.md
-# 这 7 个 tracing target 在 V1 ACCEPT 时全部为 0；任一非 0 即认为 BUG-010 家族复发。
-log_info "[3/3] BUG-010 闭环 tracing 计数器（近 10 分钟须全为 0）..."
-BUG010_TARGETS=(
-    "anchor_chain_root_mismatch"
-    "CF dropped on apply failure"
-    "pending_builds_count >= 2"
-    "leader_root_self_mismatch"
-    "leader_base_drift"
-    "follower_post_apply_root_drift"
-    "apply_state_change_out_of_band"
-)
+# 这 7 个 tracing target 在稳态（首个 "Heartbeat CF broadcasted" 之后）必须全为 0。
+#
+# 历史踩坑：
+#   BUG-A：日志通过 systemd StandardOutput=append:/opt/setu/logs/validator.log 落盘，
+#          journalctl -u setu-validator 只看到 systemd 起停事件本身，永远 0，false-pass。
+#   BUG-B：apply_state_change_out_of_band 在创世阶段必然出现 N=accounts×coins 条
+#          （seed coin 写入走 GlobalStateManager::apply_state_change，不属于 CF
+#          apply 路径），此基线非缺陷。仅统计稳态后的发生次数。
+#   BUG-C：原选 "Heartbeat CF broadcasted" 作为稳态标记，但该日志只出现在 leader
+#          节点；follower 永远 STEADY=0 触发误报。改用 "CF finalized"，所有节点
+#          在 CF finalize 后都会打印，是真正的全节点稳态信号。
+log_info "[3/3] BUG-010 闭环 tracing 计数器（稳态后须全为 0）..."
 BUG010_FAIL=0
 for HOST in "${VAL_ALIASES[@]}"; do
-    for tgt in "${BUG010_TARGETS[@]}"; do
-        cnt=$(mssh "$HOST" "sudo journalctl -u setu-validator --since '10 min ago' --no-pager 2>/dev/null | grep -c -- $(printf '%q' "$tgt")" 2>/dev/null || echo 0)
-        cnt=${cnt:-0}
+    out=$(mssh "$HOST" 'sudo bash -s' <<'REMOTE'
+set -u
+LOG=/opt/setu/logs/validator.log
+if [ ! -r "$LOG" ]; then
+    echo "MISSING_LOG"
+    exit 0
+fi
+awk '
+  BEGIN {
+    n = split("anchor_chain_root_mismatch|CF dropped on apply failure|pending_builds_count >= 2|leader_root_self_mismatch|leader_base_drift|follower_post_apply_root_drift|apply_state_change_out_of_band", t, "|")
+  }
+  /CF finalized/ { steady = 1 }
+  steady {
+    for (i = 1; i <= n; i++) if (index($0, t[i]) > 0) c[i]++
+  }
+  END {
+    printf "STEADY\t%d\n", steady + 0
+    for (i = 1; i <= n; i++) printf "%d\t%s\n", c[i] + 0, t[i]
+  }
+' "$LOG"
+REMOTE
+)
+    if [ "$out" = "MISSING_LOG" ]; then
+        log_err "[$HOST] 缺少 /opt/setu/logs/validator.log（确认 phase11 已启动）"
+        BUG010_FAIL=1
+        continue
+    fi
+    steady_seen=$(printf '%s\n' "$out" | awk -F'\t' '$1=="STEADY"{print $2}')
+    if [ "${steady_seen:-0}" -eq 0 ]; then
+        log_err "[$HOST] 未观测到任何 'CF finalized'：共识可能未启动（key 加载失败？strict 模式丢票？）"
+        log_err "  排查：grep -E 'Failed to load key|Strict vote signature mode requires' /opt/setu/logs/validator.log"
+        BUG010_FAIL=1
+        continue
+    fi
+    while IFS=$'\t' read -r cnt tgt; do
+        [ "$cnt" = "STEADY" ] && continue
+        [ -z "${cnt:-}" ] && continue
         if [ "$cnt" -gt 0 ]; then
-            log_err "[$HOST] 检出 BUG-010 信号 '${tgt}' x${cnt}（必须为 0）"
+            log_err "[$HOST] BUG-010 信号 '${tgt}' x${cnt}（稳态后必须为 0）"
             BUG010_FAIL=1
         fi
-    done
+    done <<< "$out"
 done
 if [ "$BUG010_FAIL" -ne 0 ]; then
     log_err "BUG-010 tracing 计数器非 0：详见 docs/release-doc/test-v1-inner/03-known-internal-bugs.md"
     log_err "立即冻结现场：ssh root@<host> 'cp -r /opt/setu/data /opt/setu/data.frozen-\$(date +%s)'"
     exit 1
 fi
-log_ok "BUG-010 闭环 tracing：3 节点 × 7 信号 = 0"
+log_ok "BUG-010 闭环 tracing：3 节点 × 7 信号 = 0（首个 CF finalized 之后窗口）"
 
 # ── 4. 手工验收提示 ─────────────────────────────────────────────────────────
 log_warn "手工验收清单（建议）："
