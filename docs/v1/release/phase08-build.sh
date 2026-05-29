@@ -31,15 +31,22 @@ cargo build --release \
   --features "$CARGO_FEATURES" \
   -p setu-validator -p setu-solver -p setu-cli -p setu-benchmark
 
-./target/release/setu-validator --version
+# 注意：setu-validator 未使用 clap，--version/--help 都会被忽略并直接启动节点，
+# 因此用 file/ls 做最小烟雾测试，真正的二进制有效性由下面的 strings 校验保证。
+# 注：setu-cli 这个 package 的二进制产物名为 `setu`（见 setu-cli/Cargo.toml [[bin]]）
+ls -lh ./target/release/setu-validator ./target/release/setu-solver ./target/release/setu
+file ./target/release/setu-validator | grep -q ELF || { log_err "setu-validator 不是 ELF 可执行文件"; exit 1; }
 
 # ── 2.5 V1 ACCEPT 硬性校验：diag-root-drift 探针字符串必须存在 ─────────────
 # 来源：docs/release-doc/test-v1-inner/02-build-and-deploy-flags.md
 # 缺失任一即认为该二进制不是 V1 ACCEPT 的版本，拒绝继续打包
 log_info "[2.5/3] 校验 diag-root-drift 探针字符串..."
 MISSING_DIAG=()
+# 注意：必须用 grep -c 而非 grep -q：本脚本启用 set -o pipefail，
+# grep -q 命中后立即关闭管道，strings 收到 SIGPIPE 退出非零，整条 pipeline 被判失败。
+DIAG_STRINGS=$(strings target/release/setu-validator)
 for sym in leader_root_self_mismatch follower_post_apply_root_drift apply_state_change_out_of_band; do
-    if ! strings target/release/setu-validator | grep -q "$sym"; then
+    if [ "$(printf '%s\n' "$DIAG_STRINGS" | grep -c -F "$sym")" -eq 0 ]; then
         MISSING_DIAG+=("$sym")
     fi
 done
@@ -56,9 +63,11 @@ STAGE="${SETU_BUILD_ROOT}/${RELEASE_ID}"
 log_info "[3/3] 打包到 $STAGE"
 
 mkdir -p "$STAGE"
+# 在 cd 之前预先计算 LAST_RELEASE_ID 的写入路径，避免 readlink -f "$0" 在 cd 后解析到 STAGE。
+LAST_ID_FILE="$(dirname "$(readlink -f "$0")")/LAST_RELEASE_ID"
 cp target/release/setu-validator "$STAGE/"
 cp target/release/setu-solver    "$STAGE/"
-cp target/release/setu-cli       "$STAGE/"
+cp target/release/setu              "$STAGE/setu-cli"
 cp -r setu-framework/compiled    "$STAGE/move-stdlib"
 
 cd "$STAGE"
@@ -75,8 +84,8 @@ built_by=$USER
 built_on=$(hostname)
 EOF
 
-# 记录 LAST_RELEASE_ID 供 phase09 自动读取
-echo "$RELEASE_ID" > "$(dirname "$(readlink -f "$0")")/LAST_RELEASE_ID"
+# 记录 LAST_RELEASE_ID 供 phase09 自动读取（路径在 cd 之前已预先求出）
+echo "$RELEASE_ID" > "$LAST_ID_FILE"
 
 log_ok "Phase 8 完成"
 log_info "RELEASE_ID = $RELEASE_ID"
