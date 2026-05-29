@@ -10,7 +10,7 @@ if ! [[ "$HOST" =~ ^val- ]]; then
     exit 2
 fi
 
-log_step "Phase 5 @ $HOST：运行时库 + sysctl + logrotate"
+log_step "Phase 5 @ ${HOST}：运行时库 + sysctl + logrotate"
 
 mssh "$HOST" "bash -s" <<'REMOTE'
 set -euo pipefail

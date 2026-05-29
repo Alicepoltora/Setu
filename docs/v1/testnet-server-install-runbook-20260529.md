@@ -32,11 +32,11 @@
 主机名约定（与 `docs/v1/release/inventory.env` 保持一致）：
 
 ```
-testnet-val-1  <VAL1_IP>
-testnet-val-2  <VAL2_IP>
-testnet-val-3  <VAL3_IP>
-testnet-ops    <OPS_IP>        # 同时承担 gateway、builder、monitor
-testnet.setu.org → <OPS_IP>  # 公网入口域名（A 记录，TTL 600）
+testnet-val-1  62.171.173.200
+testnet-val-2  95.111.250.6
+testnet-val-3  161.97.65.233
+testnet-ops    144.91.125.93        # 同时承担 gateway、builder、monitor
+testnet.setu.org → 144.91.125.93  # 公网入口域名（A 记录，TTL 600）
 ```
 
 维护 IP 白名单：在动手前确认并记录。本文用 `<MAINT_IP>` 占位。
@@ -75,9 +75,9 @@ testnet.setu.org → <OPS_IP>  # 公网入口域名（A 记录，TTL 600）
 ```bash
 # 节点
 VAL_HOSTS=(testnet-val-1 testnet-val-2 testnet-val-3)
-VAL_IPS=(<VAL1_IP> <VAL2_IP> <VAL3_IP>)
+VAL_IPS=(62.171.173.200 95.111.250.6 161.97.65.233)
 OPS_HOST=testnet-ops
-OPS_IP=<OPS_IP>
+OPS_IP=144.91.125.93
 GATEWAY_DOMAIN=testnet.setu.org   # 与 DNS A 记录一致
 
 # 端口
@@ -621,6 +621,8 @@ chmod 600 deploy/testnet/keys/validator-*.json
 
 ## 16. Phase 13 — ops：编译
 
+> ⚠️ **V1 ACCEPT 硬性要求**：`CARGO_FEATURES=diag-root-drift` 必须生效，否则二进制属于 V1 ACCEPT 之外的版本。`docs/v1/release/phase08-build.sh` 在编译后会用 `strings` 校验 `leader_root_self_mismatch` / `follower_post_apply_root_drift` / `apply_state_change_out_of_band` 三个探针符号，缺任一即 fail。全面说明见 [test-v1-inner/02-build-and-deploy-flags.md](../release-doc/test-v1-inner/02-build-and-deploy-flags.md)。
+
 ### 16.1 先编 Move stdlib（**强依赖**，不可跳过）
 
 ```bash
@@ -724,6 +726,16 @@ done
 ---
 
 ## 19. Phase 16 — 分发 genesis + 各自 key
+
+> ⚠️ **V1 ACCEPT 硬性要求**：在跑 `phase10-distribute-config.sh` 之前 export `SETU_RAW_TRANSFER_API_TOKEN`（3 台 validator 必须共享同一值）：
+>
+> ```bash
+> # 首次部署在 ops 生成一次并存入密码管理器
+> [ -f /tmp/setu-raw-token ] || { openssl rand -hex 32 > /tmp/setu-raw-token; chmod 600 /tmp/setu-raw-token; }
+> export SETU_RAW_TRANSFER_API_TOKEN="$(cat /tmp/setu-raw-token)"
+> ```
+>
+> phase10 会渲染 `/opt/setu/conf/env`（root:setu 0640），供 phase11 的 systemd unit 通过 `EnvironmentFile=-/opt/setu/conf/env` 加载。未 export 时 phase10 仅警告并跳过渲染（允许“只刷 genesis”场景）。全面说明见 [test-v1-inner/02-build-and-deploy-flags.md](../release-doc/test-v1-inner/02-build-and-deploy-flags.md) 与 [04-operator-runbooks.md RB-5](../release-doc/test-v1-inner/04-operator-runbooks.md)。
 
 > 推荐 `bash docs/v1/release/phase10-distribute-config.sh`。下文是等效手工命令。
 > ⚠️ 远端文件名固定为 `validator.json`（不是 `.key`），systemd unit ExecStart `--key` 也指向这个名字。
@@ -1243,6 +1255,8 @@ EOF
 ---
 
 ## 28. Phase 25 — 验收
+
+> ⚠️ **V1 ACCEPT 硬性要求**：phase12-verify.sh 会对每台 validator 近 10 分钟的 journal 检查 7 条 BUG-010 闭环 tracing target 是否全为 0（`anchor_chain_root_mismatch`、`CF dropped on apply failure`、`pending_builds_count >= 2`、`leader_root_self_mismatch`、`leader_base_drift`、`follower_post_apply_root_drift`、`apply_state_change_out_of_band`），任一非 0 即 fail 并提示冻结现场。表与含义见 [test-v1-inner/03-known-internal-bugs.md](../release-doc/test-v1-inner/03-known-internal-bugs.md) “BUG-010 Closure Signatures”；人工上下文见 [04-operator-runbooks.md RB-3](../release-doc/test-v1-inner/04-operator-runbooks.md)。
 
 ```bash
 cd /opt/setu-src/Setu

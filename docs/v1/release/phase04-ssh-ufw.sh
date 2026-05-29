@@ -12,9 +12,9 @@ log_step "Phase 4 @ $HOST ($IP)：SSH 加固 + UFW"
 # ── 选择本台 host 应用的 MAINT_IPS（分层白名单）────────────────────────────
 # 兼容旧 inventory.env（仅有 MAINT_IPS 单数组）：自动落到两个角色。
 if [[ "$HOST" == "${GATEWAY_ALIAS:-ops}" ]]; then
-    if [ "${#MAINT_IPS_OPS[@]:-0}" -gt 0 ]; then
+    if [ -n "${MAINT_IPS_OPS+x}" ] && [ "${#MAINT_IPS_OPS[@]}" -gt 0 ]; then
         MAINT_LIST=("${MAINT_IPS_OPS[@]}")
-    elif [ "${#MAINT_IPS[@]:-0}" -gt 0 ]; then
+    elif [ -n "${MAINT_IPS+x}" ] && [ "${#MAINT_IPS[@]}" -gt 0 ]; then
         log_warn "未配置 MAINT_IPS_OPS，回退到旧的 MAINT_IPS（建议升级到分层白名单）"
         MAINT_LIST=("${MAINT_IPS[@]}")
     else
@@ -22,9 +22,9 @@ if [[ "$HOST" == "${GATEWAY_ALIAS:-ops}" ]]; then
         exit 1
     fi
 else
-    if [ "${#MAINT_IPS_VAL[@]:-0}" -gt 0 ]; then
+    if [ -n "${MAINT_IPS_VAL+x}" ] && [ "${#MAINT_IPS_VAL[@]}" -gt 0 ]; then
         MAINT_LIST=("${MAINT_IPS_VAL[@]}")
-    elif [ "${#MAINT_IPS[@]:-0}" -gt 0 ]; then
+    elif [ -n "${MAINT_IPS+x}" ] && [ "${#MAINT_IPS[@]}" -gt 0 ]; then
         log_warn "未配置 MAINT_IPS_VAL，回退到旧的 MAINT_IPS（建议升级到分层白名单）"
         MAINT_LIST=("${MAINT_IPS[@]}")
     else
@@ -157,7 +157,11 @@ bantime  = 1h
 EOF
 sudo systemctl enable --now fail2ban
 sudo systemctl restart fail2ban
-# 简单自检
+# 等 socket 就绪后再自检（最多 15s）
+for i in $(seq 1 15); do
+    if sudo fail2ban-client ping >/dev/null 2>&1; then break; fi
+    sleep 1
+done
 sudo fail2ban-client status sshd >/dev/null
 REMOTE
 log_ok "fail2ban 已启用（sshd jail: 10m 内失败 5 次封 1h）"

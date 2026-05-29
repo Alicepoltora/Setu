@@ -9,7 +9,7 @@ if [ "${1:-}" = "--restart" ]; then
     ACTION=restart
 fi
 
-log_step "Phase 11：systemd unit 部署 + 串行启动（action=$ACTION）"
+log_step "Phase 11：systemd unit 部署 + 串行启动（action=${ACTION}）"
 
 # ── 飞行前校验：ExecStart 使用的 flag 是否真实存在 ──────────────────────────
 FIRST_VAL="${VAL_ALIASES[0]}"
@@ -48,7 +48,10 @@ Wants=network-online.target
 User=setu
 Group=setu
 WorkingDirectory=${SETU_HOME}
+# RUST_LOG 兑底；phase10 渲染的 /opt/setu/conf/env 可覆盖为 V1 ACCEPT 推荐值
+# 同时加载 SETU_RAW_TRANSFER_API_TOKEN（文件不存在不报错）
 Environment=RUST_LOG=info
+EnvironmentFile=-/opt/setu/conf/env
 ExecStart=${SETU_HOME}/bin/current/setu-validator \\
   --genesis ${SETU_HOME}/conf/genesis.json \\
   --key ${SETU_HOME}/keys/validator.json \\
@@ -83,6 +86,7 @@ User=setu
 Group=setu
 WorkingDirectory=${SETU_HOME}
 Environment=RUST_LOG=info
+EnvironmentFile=-/opt/setu/conf/env
 ExecStart=${SETU_HOME}/bin/current/setu-solver \\
   --validator-url http://127.0.0.1:${HTTP_PORT} \\
   --listen 127.0.0.1:${SOLVER_PORT}

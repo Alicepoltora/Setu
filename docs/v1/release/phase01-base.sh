@@ -6,7 +6,7 @@ source "$(dirname "$0")/lib.sh"
 require_args 1 $# "phase01-base.sh <host-alias>"
 HOST="$1"
 
-log_step "Phase 1 @ $HOST：基础工具安装"
+log_step "Phase 1 @ ${HOST}：基础工具安装"
 
 mssh "$HOST" "bash -s" <<'REMOTE'
 set -euo pipefail

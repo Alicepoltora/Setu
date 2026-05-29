@@ -16,7 +16,7 @@ if [ -x "$MATRIX_SCRIPT" ]; then
     }
     log_ok "remote_infra_matrix 全部 PASS"
 else
-    log_warn "未找到 $MATRIX_SCRIPT，跳过自动验收"
+    log_warn "未找到 ${MATRIX_SCRIPT}，跳过自动验收"
 fi
 
 # ── 2. 部署 health_probe.sh + cron ─────────────────────────────────────────
@@ -64,7 +64,38 @@ CRON_LINE="* * * * * $DEPLOY_DIR/health_probe.sh >/dev/null 2>&1"
 log_ok "health_probe.sh 已部署，cron 每分钟执行"
 log_info "查看日志：tail -f /var/log/setu-health.log"
 
-# ── 3. 手工验收提示 ─────────────────────────────────────────────────────────
+# ── 3. BUG-010 闭环 tracing 计数器（V1 ACCEPT 硬性要求）─────────────────────
+# 来源：docs/release-doc/test-v1-inner/03-known-internal-bugs.md
+# 这 7 个 tracing target 在 V1 ACCEPT 时全部为 0；任一非 0 即认为 BUG-010 家族复发。
+log_info "[3/3] BUG-010 闭环 tracing 计数器（近 10 分钟须全为 0）..."
+BUG010_TARGETS=(
+    "anchor_chain_root_mismatch"
+    "CF dropped on apply failure"
+    "pending_builds_count >= 2"
+    "leader_root_self_mismatch"
+    "leader_base_drift"
+    "follower_post_apply_root_drift"
+    "apply_state_change_out_of_band"
+)
+BUG010_FAIL=0
+for HOST in "${VAL_ALIASES[@]}"; do
+    for tgt in "${BUG010_TARGETS[@]}"; do
+        cnt=$(mssh "$HOST" "sudo journalctl -u setu-validator --since '10 min ago' --no-pager 2>/dev/null | grep -c -- $(printf '%q' "$tgt")" 2>/dev/null || echo 0)
+        cnt=${cnt:-0}
+        if [ "$cnt" -gt 0 ]; then
+            log_err "[$HOST] 检出 BUG-010 信号 '${tgt}' x${cnt}（必须为 0）"
+            BUG010_FAIL=1
+        fi
+    done
+done
+if [ "$BUG010_FAIL" -ne 0 ]; then
+    log_err "BUG-010 tracing 计数器非 0：详见 docs/release-doc/test-v1-inner/03-known-internal-bugs.md"
+    log_err "立即冻结现场：ssh root@<host> 'cp -r /opt/setu/data /opt/setu/data.frozen-\$(date +%s)'"
+    exit 1
+fi
+log_ok "BUG-010 闭环 tracing：3 节点 × 7 信号 = 0"
+
+# ── 4. 手工验收提示 ─────────────────────────────────────────────────────────
 log_warn "手工验收清单（建议）："
 echo "  1. 关掉任意 1 台 validator，集群仍出块（BFT 容错）"
 echo "     sudo systemctl stop setu-validator setu-solver   # 在 val-1"

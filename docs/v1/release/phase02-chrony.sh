@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib.sh"
 require_args 1 $# "phase02-chrony.sh <host-alias>"
 HOST="$1"
 
-log_step "Phase 2 @ $HOST：chrony 替换 systemd-timesyncd"
+log_step "Phase 2 @ ${HOST}：chrony 替换 systemd-timesyncd"
 
 mssh "$HOST" "bash -s" <<'REMOTE'
 set -euo pipefail
@@ -17,4 +17,4 @@ sleep 5
 chronyc tracking | grep -E 'Leap status|System time'
 REMOTE
 
-log_ok "Phase 2 完成 @ $HOST（检查 Leap status: Normal 与偏差 < 100ms）"
+log_ok "Phase 2 完成 @ ${HOST}（检查 Leap status: Normal 与偏差 < 100ms）"

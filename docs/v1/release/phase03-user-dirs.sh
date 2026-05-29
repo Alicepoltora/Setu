@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib.sh"
 require_args 1 $# "phase03-user-dirs.sh <host-alias>"
 HOST="$1"
 
-log_step "Phase 3 @ $HOST：用户与目录"
+log_step "Phase 3 @ ${HOST}：用户与目录"
 
 mssh "$HOST" "SETU_HOME='$SETU_HOME' bash -s" <<'REMOTE'
 set -euo pipefail

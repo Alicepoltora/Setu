@@ -40,16 +40,30 @@ fi
 # ── 2. 渲染 nginx 配置 ─────────────────────────────────────────────────────
 log_info "[2] 生成 /etc/nginx/conf.d/setu.conf"
 
+# Chicken-and-egg：USE_TLS=1 但本地还没有 Let's Encrypt 证书时，先按 HTTP-only 落盘，
+# 让 nginx -t 通过，certbot --nginx 在 §4 自动改写配置加 ssl 块 + 301。
+HAS_CERT=0
 if [ "$USE_TLS" = "1" ]; then
+    if mssh "$GW" "[ -s /etc/letsencrypt/live/${GATEWAY_DOMAIN}/fullchain.pem ]" 2>/dev/null; then
+        HAS_CERT=1
+    fi
+fi
+
+if [ "$USE_TLS" = "1" ] && [ "$HAS_CERT" = "1" ]; then
     SERVER_NAME="$GATEWAY_DOMAIN"
     LISTEN_LINE="listen ${GATEWAY_HTTPS_PORT:-443} ssl http2;"
-    # 证书路径待 certbot 写入；先用占位，certbot --nginx 会自动接管
     TLS_LINES=$(cat <<EOT
     ssl_certificate     /etc/letsencrypt/live/${GATEWAY_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${GATEWAY_DOMAIN}/privkey.pem;
 EOT
 )
     REDIRECT_BLOCK="server { listen 80; server_name ${GATEWAY_DOMAIN}; return 301 https://\$host\$request_uri; }"
+elif [ "$USE_TLS" = "1" ]; then
+    log_info "  尚无 Let's Encrypt 证书，先以 HTTP 模式启动 nginx，待 certbot 签发后由 certbot --nginx 自动接管 TLS"
+    SERVER_NAME="$GATEWAY_DOMAIN"
+    LISTEN_LINE="listen 80;"
+    TLS_LINES=""
+    REDIRECT_BLOCK=""
 else
     SERVER_NAME="_"
     LISTEN_LINE="listen 80;"

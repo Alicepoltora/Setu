@@ -26,12 +26,29 @@ fi
 log_ok "stdlib 编译完成"
 
 # ── 2. 编 Rust release ─────────────────────────────────────────────────────
-log_info "[2/3] cargo build --release（features: $CARGO_FEATURES）..."
+log_info "[2/3] cargo build --release（features: ${CARGO_FEATURES}）..."
 cargo build --release \
   --features "$CARGO_FEATURES" \
   -p setu-validator -p setu-solver -p setu-cli -p setu-benchmark
 
 ./target/release/setu-validator --version
+
+# ── 2.5 V1 ACCEPT 硬性校验：diag-root-drift 探针字符串必须存在 ─────────────
+# 来源：docs/release-doc/test-v1-inner/02-build-and-deploy-flags.md
+# 缺失任一即认为该二进制不是 V1 ACCEPT 的版本，拒绝继续打包
+log_info "[2.5/3] 校验 diag-root-drift 探针字符串..."
+MISSING_DIAG=()
+for sym in leader_root_self_mismatch follower_post_apply_root_drift apply_state_change_out_of_band; do
+    if ! strings target/release/setu-validator | grep -q "$sym"; then
+        MISSING_DIAG+=("$sym")
+    fi
+done
+if [ "${#MISSING_DIAG[@]}" -gt 0 ]; then
+    log_err "setu-validator 二进制缺失 diag-root-drift 探针：${MISSING_DIAG[*]}"
+    log_err "请确认 inventory.env 中 CARGO_FEATURES 包含 diag-root-drift 并重新编译"
+    exit 1
+fi
+log_ok "diag-root-drift 3 个探针字符串均存在"
 
 # ── 3. 打包 ─────────────────────────────────────────────────────────────────
 RELEASE_ID=$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)
