@@ -550,6 +550,26 @@ impl Event {
     pub fn genesis(creator: String, vlc_snapshot: VLCSnapshot) -> Self {
         Self::new(EventType::Genesis, vec![], vlc_snapshot, creator)
     }
+
+    /// Canonical id of the chain's genesis event.
+    ///
+    /// The validator builds the genesis event deterministically
+    /// (`setu-validator/src/main.rs`): empty `parent_ids`, fixed creator
+    /// `"genesis"`, `timestamp = 0`, and `logical_time = 0`. `compute_id` hashes
+    /// exactly those four inputs, so the genesis event id is a fixed,
+    /// chain-independent constant
+    /// (`691c8dd61cdc0391ae5414ce9b6ac9be3ef205ba61daa9cb58dc0b3989e0dd6d`).
+    ///
+    /// Task preparation uses this to drop the genesis parent edge from a
+    /// never-moved coin before `compute_id`, preventing `ParentTooOld` once the
+    /// DAG depth floor advances past `max_cross_cf_depth`. See
+    /// `docs/feat/fix-transfer-parent-too-old/design.md`.
+    pub fn genesis_event_id() -> EventId {
+        // `logical_time = 0` is the only vlc field that feeds `compute_id`.
+        let mut vlc = VLCSnapshot::new();
+        vlc.logical_time = 0;
+        Self::compute_id(&[], &vlc, "genesis", 0)
+    }
     
     /// Create a transfer event
     pub fn transfer(
@@ -996,6 +1016,28 @@ mod tests {
         let event = Event::genesis("node1".to_string(), create_vlc_snapshot());
         assert!(event.is_genesis());
         assert!(!event.has_parents());
+    }
+
+    /// Guards the genesis-parent-drop fix
+    /// (docs/feat/fix-transfer-parent-too-old). `Event::genesis_event_id()` must
+    /// equal both the literal id observed on testnet and an event built exactly
+    /// the way the validator builds genesis. If genesis construction in main.rs
+    /// ever changes (creator/timestamp/logical_time), this test fails loudly so
+    /// the task-preparer filter does not silently stop matching.
+    #[test]
+    fn test_genesis_event_id_is_canonical_constant() {
+        const EXPECTED: &str =
+            "691c8dd61cdc0391ae5414ce9b6ac9be3ef205ba61daa9cb58dc0b3989e0dd6d";
+        assert_eq!(Event::genesis_event_id(), EXPECTED);
+
+        // Mirror setu-validator/src/main.rs genesis construction.
+        let mut vlc = VLCSnapshot::new();
+        vlc.physical_time = 0;
+        let mut genesis = Event::genesis("genesis".to_string(), vlc);
+        genesis.timestamp = 0;
+        genesis.recompute_id();
+        assert_eq!(genesis.id, Event::genesis_event_id());
+        assert!(genesis.verify_id());
     }
 
     /// Regression test for docs/bugs/20260424-contract-publish-event-id-tampering.md:

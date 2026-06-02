@@ -869,9 +869,24 @@ impl TaskPreparer {
     fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
         let mut parent_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        
+        // Drop the genesis parent edge: a coin that has never moved since
+        // genesis carries the genesis event id as its last modifier. Once the
+        // DAG depth floor advances past `max_cross_cf_depth`, that edge is
+        // rejected as `ParentTooOld`, blocking transfers of long-idle coins.
+        // Double-spend safety is independent of this edge (enforced by the
+        // `old_value` conflict check at apply time), so dropping it is safe.
+        // See docs/feat/fix-transfer-parent-too-old/design.md.
+        let genesis_id = Event::genesis_event_id();
+
         for object_id in input_objects {
             if let Some(event_id) = self.state_provider.get_last_modifying_event(object_id) {
+                if event_id == genesis_id {
+                    debug!(
+                        object_id = %object_id,
+                        "Dropping genesis parent edge for never-moved coin"
+                    );
+                    continue;
+                }
                 // Deduplicate: same event might have modified multiple objects
                 if seen.insert(event_id.clone()) {
                     debug!(
@@ -1784,6 +1799,64 @@ mod tests {
             version: 1,
             coin_type: "ROOT".to_string(),
         }
+    }
+
+    /// Mock provider that returns a caller-supplied `last_modifying_event` per
+    /// object id, so `derive_dependencies` can be tested in isolation.
+    struct FixedParentProvider {
+        last_modifier: std::collections::HashMap<ObjectId, String>,
+    }
+
+    impl StateProvider for FixedParentProvider {
+        fn get_coins_for_address(&self, _address: &str) -> Vec<CoinInfo> {
+            Vec::new()
+        }
+        fn get_object(&self, _object_id: &ObjectId) -> Option<Vec<u8>> {
+            None
+        }
+        fn get_state_root(&self) -> [u8; 32] {
+            [0u8; 32]
+        }
+        fn get_merkle_proof(&self, _object_id: &ObjectId) -> Option<crate::SimpleMerkleProof> {
+            None
+        }
+        fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
+            self.last_modifier.get(object_id).cloned()
+        }
+    }
+
+    /// The genesis parent edge must be dropped (it is depth-0 and trips
+    /// `ParentTooOld` once the floor advances), while a normal parent is kept.
+    /// Guards docs/feat/fix-transfer-parent-too-old.
+    #[test]
+    fn test_derive_dependencies_drops_genesis_parent() {
+        let cold = ObjectId::new([0xAA; 32]); // never moved since genesis
+        let warm = ObjectId::new([0xBB; 32]); // moved by a normal event
+        let normal_parent = "a".repeat(64);
+
+        let mut last_modifier = std::collections::HashMap::new();
+        last_modifier.insert(cold, Event::genesis_event_id());
+        last_modifier.insert(warm, normal_parent.clone());
+
+        let preparer = TaskPreparer::new(
+            "validator-1".to_string(),
+            Arc::new(FixedParentProvider { last_modifier }),
+        );
+
+        // Cold coin alone → genesis parent dropped → empty parent set.
+        assert!(preparer.derive_dependencies(&[&cold]).is_empty());
+
+        // Warm coin alone → normal parent kept.
+        assert_eq!(
+            preparer.derive_dependencies(&[&warm]),
+            vec![normal_parent.clone()]
+        );
+
+        // Mixed → only the normal parent survives.
+        assert_eq!(
+            preparer.derive_dependencies(&[&cold, &warm]),
+            vec![normal_parent]
+        );
     }
     
     #[test]

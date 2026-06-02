@@ -634,8 +634,14 @@ impl BatchTaskPreparer {
         coin_object_id: &ObjectId,
         snapshot: &BatchStateSnapshot,
     ) -> Vec<String> {
+        // Drop the genesis parent edge (see single.rs::derive_dependencies and
+        // docs/feat/fix-transfer-parent-too-old/design.md): a never-moved coin
+        // references the depth-0 genesis event, which trips `ParentTooOld` once
+        // the depth floor advances past `max_cross_cf_depth`.
+        let genesis_id = Event::genesis_event_id();
         snapshot
             .get_last_modifying_event(coin_object_id)
+            .filter(|event_id| **event_id != genesis_id)
             .map(|event_id| vec![event_id.clone()])
             .unwrap_or_default()
     }
