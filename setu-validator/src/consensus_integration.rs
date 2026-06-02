@@ -596,8 +596,23 @@ impl ConsensusValidator {
         // TEE attestation verification is done by the TeeVerifier when enabled
         if let Some(ref exec_result) = event.execution_result {
             if !exec_result.success {
+                // Propagate the solver's real failure reason (joined `failure_reasons`)
+                // instead of an opaque generic string. Without this, every solver
+                // execution failure (Invalid address, insufficient balance, etc.)
+                // collapses into one indistinguishable message at the API boundary,
+                // masking distinct root causes (see docs/bugs/20260602-solver-exec-reason-swallowed.md).
+                let reason = exec_result
+                    .message
+                    .as_deref()
+                    .unwrap_or("execution failed without a reported reason");
+                warn!(
+                    event_id = %event.id,
+                    creator = %event.creator,
+                    reason = %reason,
+                    "Rejecting event: solver execution result is not successful"
+                );
                 return Err(SetuError::InvalidData(
-                    "Event execution result is not successful".to_string()
+                    format!("Event execution failed: {}", reason)
                 ));
             }
         }
@@ -1218,6 +1233,66 @@ mod tests {
         
         let stats = validator.dag_stats().await;
         assert_eq!(stats.node_count, 1);
+    }
+
+    /// Phase 0 (fix-transfer-parent-too-old): a failed solver execution result
+    /// must surface the solver's real reason, not the old opaque generic string.
+    #[tokio::test]
+    async fn test_submit_event_failed_execution_propagates_reason() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let mut event = create_test_event("solver-1");
+        // `execution_result` is not part of compute_id, so verify_id() still holds.
+        event.execution_result = Some(setu_types::ExecutionResult {
+            success: false,
+            message: Some(
+                "1 events failed out of 1: Invalid address: 0x3003dcf5b1edaf47344b23660ce5b038301ee292c3e"
+                    .to_string(),
+            ),
+            state_changes: vec![],
+        });
+
+        let err = validator
+            .submit_event(event)
+            .await
+            .expect_err("failed execution must be rejected");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("Invalid address"),
+            "rejection must propagate the solver reason, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Event execution result is not successful"),
+            "rejection must not use the old opaque generic string, got: {msg}"
+        );
+    }
+
+    /// Phase 0: when the solver reports failure without a message (should never
+    /// happen given tee.rs always fills it, but defended), fall back gracefully.
+    #[tokio::test]
+    async fn test_submit_event_failed_execution_none_message_fallback() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let mut event = create_test_event("solver-1");
+        event.execution_result = Some(setu_types::ExecutionResult {
+            success: false,
+            message: None,
+            state_changes: vec![],
+        });
+
+        let err = validator
+            .submit_event(event)
+            .await
+            .expect_err("failed execution must be rejected");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("execution failed without a reported reason"),
+            "missing reason must fall back to a descriptive default, got: {msg}"
+        );
     }
 
     #[tokio::test]
