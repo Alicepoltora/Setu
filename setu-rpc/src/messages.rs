@@ -170,6 +170,10 @@ pub struct SolverListItem {
     pub current_load: u32,
     pub status: String,
     pub shard_id: Option<String>,
+    /// Whether THIS validator can currently route to the solver (present in its
+    /// local RouterManager). Registry membership (this entry existing) does not
+    /// imply routability — a replayed-only solver reports `routable = false`.
+    pub routable: bool,
 }
 
 /// Response with solver list

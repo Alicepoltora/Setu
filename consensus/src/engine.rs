@@ -353,6 +353,11 @@ impl ConsensusEngine {
         self.strict_vote_signatures.load(Ordering::SeqCst)
     }
 
+    /// Read-only accessor for strict vote signature enforcement (health telemetry).
+    pub fn strict_vote_signatures_enabled(&self) -> bool {
+        self.require_vote_signatures()
+    }
+
     /// Take all pending anchors that were finalized inline (single-node mode).
     /// Callers should persist these anchors to durable storage.
     /// Returns an empty Vec if no anchors are pending.

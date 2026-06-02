@@ -264,7 +264,11 @@ pub trait ValidatorService: Send + Sync {
     
     /// Get solver count
     fn solver_count(&self) -> usize;
-    
+
+    /// Number of solvers in the registration registry (replay-rebuilt).
+    /// May exceed `solver_count()`, which reflects locally routable solvers.
+    fn registered_solver_count(&self) -> usize;
+
     /// Get validator count
     fn validator_count(&self) -> usize;
     
@@ -294,6 +298,10 @@ pub trait ValidatorService: Send + Sync {
     
     /// Get events
     fn get_events(&self) -> Vec<setu_types::event::Event>;
+
+    /// Read-only consensus-finality snapshot for `/health`.
+    /// Returns `None` when this node runs without an attached consensus engine.
+    fn consensus_health(&self) -> impl std::future::Future<Output = Option<ConsensusHealth>> + Send;
 
     /// R5 · Get a single event's full status (execution + on-chain verdict).
     /// Returns `None` if the event is not known to this validator.
@@ -599,14 +607,20 @@ pub async fn http_health<S: ValidatorService>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
+    let consensus = service.consensus_health().await;
+
     Json(serde_json::json!({
         "status": "healthy",
         "validator_id": service.validator_id(),
         "uptime_seconds": now - service.start_time(),
         "solver_count": service.solver_count(),
+        "routable_solver_count": service.solver_count(),
+        "registered_solver_count": service.registered_solver_count(),
         "validator_count": service.validator_count(),
         "dag_events_count": service.dag_events_count(),
+        "consensus_enabled": consensus.is_some(),
+        "consensus": consensus,
     }))
 }
 

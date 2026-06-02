@@ -30,6 +30,34 @@ pub struct SubmitEventResponse {
 }
 
 // ============================================
+// Consensus Health (B2 telemetry)
+// ============================================
+
+/// Read-only snapshot of consensus-finality progress for `/api/v1/health`.
+///
+/// All fields are read from existing in-memory consensus state; this type adds
+/// no write path. Progress alerting MUST target the monotonic fields
+/// (`consensus_round`, `anchor_depth`), never `finalized_cf_buffer_len`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusHealth {
+    /// Current consensus round (monotonic; restored from persisted anchors on restart).
+    pub consensus_round: u64,
+    /// AnchorBuilder depth (monotonic; restored on restart).
+    pub anchor_depth: u64,
+    /// ID of the most recently finalized anchor, if any.
+    pub last_finalized_anchor_id: Option<String>,
+    /// Depth of the most recently finalized anchor, if any.
+    pub last_finalized_anchor_depth: Option<u64>,
+    /// In-memory finalized-CF buffer length. NOT cumulative — GC-bounded (<=1000).
+    /// Do NOT alert on this plateauing; use `consensus_round`/`anchor_depth`.
+    pub finalized_cf_buffer_len: usize,
+    /// Number of pending (proposed, not-yet-finalized) consensus frames.
+    pub pending_cf_count: usize,
+    /// Whether strict vote signature enforcement is enabled.
+    pub strict_vote_signatures: bool,
+}
+
+// ============================================
 // State Query Types (Scheme B)
 // ============================================
 

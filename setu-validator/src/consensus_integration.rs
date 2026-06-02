@@ -782,6 +782,36 @@ impl ConsensusValidator {
     pub async fn current_round(&self) -> Round {
         self.engine.current_round().await
     }
+
+    /// Build a read-only consensus-finality snapshot for `/health` telemetry.
+    ///
+    /// Reads only existing in-memory consensus state (no writes). The monotonic
+    /// fields (`consensus_round`, `anchor_depth`) are the alerting targets;
+    /// `finalized_cf_buffer_len` is GC-bounded (<=1000) and must not be used
+    /// for progress detection.
+    pub async fn consensus_health_snapshot(&self) -> setu_api::ConsensusHealth {
+        let consensus_round = self.engine.current_round().await;
+        let strict_vote_signatures = self.engine.strict_vote_signatures_enabled();
+
+        let cm = self.engine.consensus_manager().read().await;
+        let finalized_cf_buffer_len = cm.finalized_count();
+        let pending_cf_count = cm.pending_cfs_len();
+        let (last_finalized_anchor_id, last_finalized_anchor_depth) = match cm.last_finalized_cf() {
+            Some(cf) => (Some(cf.anchor.id.clone()), Some(cf.anchor.depth)),
+            None => (None, None),
+        };
+        let anchor_depth = cm.anchor_builder().anchor_depth();
+
+        setu_api::ConsensusHealth {
+            consensus_round,
+            anchor_depth,
+            last_finalized_anchor_id,
+            last_finalized_anchor_depth,
+            finalized_cf_buffer_len,
+            pending_cf_count,
+            strict_vote_signatures,
+        }
+    }
     
     /// Get the leader for a specific round
     pub async fn get_leader_for_round(&self, round: Round) -> Option<String> {
@@ -1210,6 +1240,33 @@ mod tests {
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_health_snapshot_fresh() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let health = validator.consensus_health_snapshot().await;
+        // Fresh node: nothing finalized yet, monotonic fields at zero.
+        assert_eq!(health.consensus_round, 0);
+        assert_eq!(health.anchor_depth, 0);
+        assert_eq!(health.last_finalized_anchor_id, None);
+        assert_eq!(health.last_finalized_anchor_depth, None);
+        assert_eq!(health.finalized_cf_buffer_len, 0);
+        assert_eq!(health.pending_cf_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_health_snapshot_strict_flag_tracks_engine() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        // Constructors are permissive by default; enabling strict enforcement
+        // must be reflected in the health snapshot.
+        validator.engine().enable_strict_vote_signatures();
+        let after = validator.consensus_health_snapshot().await;
+        assert!(after.strict_vote_signatures);
     }
 
     #[tokio::test]

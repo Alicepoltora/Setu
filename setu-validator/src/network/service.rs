@@ -1363,9 +1363,8 @@ impl ValidatorNetworkService {
 
     /// Apply a single event during DAG replay (synchronous, no async needed).
     ///
-    /// Unlike `apply_event_side_effects()` which reads from `self.events` DashMap,
-    /// this method takes the event directly — because the events cache is not
-    /// populated during replay.
+    /// Unlike the live network event path, this method takes the event directly —
+    /// because the events cache is not populated during replay.
     pub fn apply_replay_event(&self, event: &Event) -> crate::dag_replay::ReplayAction {
         use crate::dag_replay::{ReplayAction, ReplayKind};
 
@@ -1546,52 +1545,6 @@ impl ValidatorNetworkService {
     pub fn get_all_solvers(&self) -> Vec<SolverInfo> {
         self.solver_info.iter().map(|r| r.value().clone()).collect()
     }
-
-    /// Apply event side effects (called from registration handler)
-    pub async fn apply_event_side_effects(&self, event_id: &str) {
-        let event = match self.events.get(event_id).map(|e| e.clone()) {
-            Some(e) => e,
-            None => return,
-        };
-
-        match &event.payload {
-            EventPayload::ValidatorRegister(reg) => {
-                self.validators.write().insert(
-                    reg.validator_id.clone(),
-                    ValidatorInfo::from_registration(reg, "online", event.timestamp),
-                );
-            }
-            EventPayload::SolverUnregister(unreg) => self.unregister_solver(&unreg.node_id),
-            EventPayload::SolverRegister(reg) => {
-                let request = setu_rpc::RegisterSolverRequest {
-                    solver_id: reg.solver_id.clone(),
-                    address: reg.address.clone(),
-                    port: reg.port,
-                    account_address: reg.account_address.clone(),
-                    public_key: reg.public_key.clone(),
-                    signature: reg.signature.clone(),
-                    capacity: reg.capacity,
-                    shard_id: reg.shard_id.clone(),
-                    assigned_shard: reg.assigned_shard,
-                    resources: reg.resources.clone(),
-                    permitted_subnets: reg.permitted_subnets.iter()
-                        .map(|s| hex::encode(s.as_bytes()))
-                        .collect(),
-                };
-                self.register_solver_internal(&request);
-            }
-            EventPayload::ValidatorUnregister(unreg) => {
-                self.validators.write().remove(&unreg.node_id);
-            }
-            EventPayload::SubnetRegister(reg) => {
-                self.registered_subnets.insert(
-                    reg.subnet_id.clone(),
-                    SubnetInfo::from_registration(reg, event.timestamp),
-                );
-            }
-            _ => {}
-        }
-    }
 }
 
 // ============================================
@@ -1609,6 +1562,10 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     fn solver_count(&self) -> usize {
         self.router_manager.solver_count()
+    }
+
+    fn registered_solver_count(&self) -> usize {
+        self.solver_info.len()
     }
 
     fn validator_count(&self) -> usize {
@@ -1651,6 +1608,13 @@ impl setu_api::ValidatorService for ValidatorNetworkService {
 
     fn get_events(&self) -> Vec<Event> {
         self.get_events()
+    }
+
+    async fn consensus_health(&self) -> Option<setu_api::ConsensusHealth> {
+        match self.consensus_validator.as_ref() {
+            Some(consensus) => Some(consensus.consensus_health_snapshot().await),
+            None => None,
+        }
     }
 
     fn get_event_by_id(&self, event_id: &str) -> Option<setu_api::GetEventResponse> {
