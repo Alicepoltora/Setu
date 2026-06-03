@@ -22,6 +22,10 @@ use setu_rpc::{
 };
 use setu_types::registration::UserRegistration;
 use setu_types::{ObjectId, hash_utils::setu_hash_with_domain};
+use setu_types::{
+    SETU_DECIMALS, SETU_SYMBOL, format_setu_units, is_setu_token_identifier,
+    parse_setu_amount_to_units,
+};
 use setu_types::{FluxState, PowerState, flux_state_object_id, power_state_object_id, INITIAL_POWER, INITIAL_FLUX};
 use setu_vlc::VLCSnapshot;
 use std::sync::Arc;
@@ -128,6 +132,64 @@ impl ValidatorUserHandler {
         address.starts_with("0x") && (address.len() == 66 || address.len() == 42)
     }
 
+    fn resolve_transfer_amount(request: &TransferRequest, coin_type: &str) -> Result<u64, String> {
+        if !is_setu_token_identifier(coin_type) {
+            return Err(
+                "Signed user transfers currently support SETU only; non-SETU token transfers are deferred"
+                    .to_string(),
+            );
+        }
+
+        let parsed_display = match request.display_amount.as_deref() {
+            Some(display_amount) => {
+                Some(
+                    parse_setu_amount_to_units(display_amount)
+                        .map_err(|e| format!("Invalid display_amount: {}", e))?,
+                )
+            }
+            None => None,
+        };
+
+        match (request.amount, parsed_display) {
+            (Some(raw), Some(display_units)) if raw != display_units => Err(
+                "amount and display_amount do not match after SETU decimal conversion".to_string(),
+            ),
+            (Some(raw), _) => Ok(raw),
+            (None, Some(display_units)) => Ok(display_units),
+            (None, None) => Err("Transfer amount is required".to_string()),
+        }
+    }
+
+    fn coin_type_matches_filter(coin_type: &str, filter: &str) -> bool {
+        if is_setu_token_identifier(filter) {
+            is_setu_token_identifier(coin_type)
+        } else {
+            coin_type == filter
+        }
+    }
+
+    fn display_coin_balance(coin_type: String, balance: u64, coin_count: u32) -> CoinBalance {
+        if is_setu_token_identifier(&coin_type) {
+            CoinBalance {
+                coin_type,
+                balance,
+                coin_count,
+                symbol: SETU_SYMBOL.to_string(),
+                decimals: SETU_DECIMALS,
+                display_balance: format_setu_units(balance),
+            }
+        } else {
+            CoinBalance {
+                symbol: coin_type.clone(),
+                coin_type,
+                balance,
+                coin_count,
+                decimals: 0,
+                display_balance: balance.to_string(),
+            }
+        }
+    }
+
     fn canonical_transfer_message(
         from: &str,
         to: &str,
@@ -224,6 +286,139 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn transfer_amount_accepts_raw_units() {
+        let request = setu_rpc::TransferRequest {
+            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            amount: Some(123_000_000),
+            display_amount: None,
+            coin_type: Some("setu".to_string()),
+            memo: None,
+            message: None,
+            timestamp: 1778390000000,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        };
+
+        assert_eq!(
+            ValidatorUserHandler::resolve_transfer_amount(&request, "setu"),
+            Ok(123_000_000)
+        );
+    }
+
+    #[test]
+    fn transfer_amount_accepts_setu_display_amount() {
+        let request = setu_rpc::TransferRequest {
+            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            amount: None,
+            display_amount: Some("1.23".to_string()),
+            coin_type: Some("setu".to_string()),
+            memo: None,
+            message: None,
+            timestamp: 1778390000000,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        };
+
+        assert_eq!(
+            ValidatorUserHandler::resolve_transfer_amount(&request, "setu"),
+            Ok(123_000_000)
+        );
+    }
+
+    #[test]
+    fn transfer_amount_rejects_raw_display_mismatch() {
+        let request = setu_rpc::TransferRequest {
+            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            amount: Some(120_000_000),
+            display_amount: Some("1.23".to_string()),
+            coin_type: Some("setu".to_string()),
+            memo: None,
+            message: None,
+            timestamp: 1778390000000,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        };
+
+        let error = ValidatorUserHandler::resolve_transfer_amount(&request, "setu")
+            .expect_err("mismatched amount forms must be rejected");
+        assert!(error.contains("do not match"));
+    }
+
+    #[test]
+    fn transfer_amount_rejects_non_setu_raw_amount() {
+        let request = setu_rpc::TransferRequest {
+            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            amount: Some(123_000_000),
+            display_amount: None,
+            coin_type: Some("game".to_string()),
+            memo: None,
+            message: None,
+            timestamp: 1778390000000,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        };
+
+        let error = ValidatorUserHandler::resolve_transfer_amount(&request, "game")
+            .expect_err("non-SETU raw amount must be rejected in SETU-only user transfer path");
+        assert!(error.contains("SETU only"));
+    }
+
+    #[test]
+    fn transfer_amount_rejects_non_setu_display_amount() {
+        let request = setu_rpc::TransferRequest {
+            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            amount: None,
+            display_amount: Some("1.23".to_string()),
+            coin_type: Some("game".to_string()),
+            memo: None,
+            message: None,
+            timestamp: 1778390000000,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        };
+
+        let error = ValidatorUserHandler::resolve_transfer_amount(&request, "game")
+            .expect_err("non-SETU display amount must be rejected in first implementation");
+        assert!(error.contains("SETU only"));
+    }
+
+    #[test]
+    fn coin_type_filter_matches_setu_aliases() {
+        assert!(ValidatorUserHandler::coin_type_matches_filter("ROOT", "setu"));
+        assert!(ValidatorUserHandler::coin_type_matches_filter("setu", "ROOT"));
+        assert!(!ValidatorUserHandler::coin_type_matches_filter("game", "setu"));
+        assert!(ValidatorUserHandler::coin_type_matches_filter("game", "game"));
+    }
+
+    #[test]
+    fn display_coin_balance_formats_setu_units() {
+        let balance = ValidatorUserHandler::display_coin_balance("ROOT".to_string(), 123_000_000, 2);
+
+        assert_eq!(balance.symbol, "SETU");
+        assert_eq!(balance.decimals, 8);
+        assert_eq!(balance.display_balance, "1.23");
+    }
+
+    #[test]
+    fn display_coin_balance_falls_back_for_non_setu() {
+        let balance = ValidatorUserHandler::display_coin_balance("game".to_string(), 12345, 1);
+
+        assert_eq!(balance.symbol, "game");
+        assert_eq!(balance.decimals, 0);
+        assert_eq!(balance.display_balance, "12345");
     }
 }
 
@@ -446,7 +641,7 @@ impl UserRpcHandler for ValidatorUserHandler {
 
         let coins = self.network_service.state_provider().get_coins_for_address(&request.address);
         let setu_balance: u64 = coins.iter()
-            .filter(|c| c.coin_type == "ROOT")
+            .filter(|c| is_setu_token_identifier(&c.coin_type))
             .map(|c| c.balance)
             .sum();
 
@@ -470,6 +665,8 @@ impl UserRpcHandler for ValidatorUserHandler {
             found: !coins.is_empty(),
             address: request.address,
             setu_balance,
+            setu_decimals: SETU_DECIMALS,
+            setu_display_balance: format_setu_units(setu_balance),
             power,
             flux,
             profile: None,
@@ -491,24 +688,38 @@ impl UserRpcHandler for ValidatorUserHandler {
         }
 
         // Optional filter by coin_type
-        let balances: Vec<CoinBalance> = type_map.into_iter()
+        let mut balances: Vec<CoinBalance> = type_map.into_iter()
             .filter(|(ct, _)| {
-                request.coin_type.as_ref().map_or(true, |filter| ct == filter)
+                request.coin_type.as_ref().map_or(true, |filter| {
+                    Self::coin_type_matches_filter(ct, filter)
+                })
             })
-            .map(|(coin_type, (balance, coin_count))| CoinBalance {
-                coin_type,
-                balance,
-                coin_count,
+            .map(|(coin_type, (balance, coin_count))| {
+                Self::display_coin_balance(coin_type, balance, coin_count)
             })
             .collect();
+        balances.sort_by(|a, b| a.coin_type.cmp(&b.coin_type).then(a.symbol.cmp(&b.symbol)));
 
         let total_balance = balances.iter().map(|b| b.balance).sum();
+        let (total_display_balance, total_decimals, total_symbol) = if balances.len() == 1 {
+            let balance = &balances[0];
+            (
+                Some(balance.display_balance.clone()),
+                Some(balance.decimals),
+                Some(balance.symbol.clone()),
+            )
+        } else {
+            (None, None, None)
+        };
 
         GetBalanceResponse {
             found: !coins.is_empty(),
             address: request.address,
             balances,
             total_balance,
+            total_display_balance,
+            total_decimals,
+            total_symbol,
         }
     }
     
@@ -569,10 +780,20 @@ impl UserRpcHandler for ValidatorUserHandler {
     }
     
     async fn transfer(&self, request: TransferRequest) -> TransferResponse {
+        let coin_type = request
+            .coin_type
+            .clone()
+            .unwrap_or_else(|| "setu".to_string())
+            .to_lowercase();
+        let amount_units = match Self::resolve_transfer_amount(&request, &coin_type) {
+            Ok(amount) => amount,
+            Err(e) => return Self::transfer_err(&e),
+        };
+
         info!(
             from = %request.from,
             to = %request.to,
-            amount = request.amount,
+            amount = amount_units,
             "Processing transfer request"
         );
 
@@ -588,7 +809,7 @@ impl UserRpcHandler for ValidatorUserHandler {
             );
         }
 
-        if request.amount == 0 {
+        if amount_units == 0 {
             return Self::transfer_err("Transfer amount must be greater than zero");
         }
 
@@ -596,15 +817,10 @@ impl UserRpcHandler for ValidatorUserHandler {
             return Self::transfer_err(&e);
         }
 
-        let coin_type = request
-            .coin_type
-            .clone()
-            .unwrap_or_else(|| "setu".to_string())
-            .to_lowercase();
         let expected_message = Self::canonical_transfer_message(
             &request.from,
             &request.to,
-            request.amount,
+            amount_units,
             &coin_type,
             request.timestamp,
         );
@@ -636,7 +852,7 @@ impl UserRpcHandler for ValidatorUserHandler {
         let submit_request = SubmitTransferRequest {
             from: request.from,
             to: request.to,
-            amount: request.amount,
+            amount: amount_units,
             transfer_type: coin_type,
             resources: vec![],
             preferred_solver: None,

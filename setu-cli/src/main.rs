@@ -4,7 +4,7 @@
 //!   setu validator register --id validator-1 --address 127.0.0.1 --port 9000
 //!   setu solver register --id solver-1 --address 127.0.0.1 --port 8001 --shard shard-1
 //!   setu router status
-//!   setu transfer submit --from alice --to bob --amount 1000
+//!   setu transfer submit --from alice --to bob --amount 1.23
 
 mod commands;
 mod config;
@@ -483,9 +483,13 @@ enum TransferAction {
         #[arg(long)]
         to: String,
         
-        /// Transfer amount
-        #[arg(long)]
-        amount: i128,
+        /// Transfer amount as a SETU display value, e.g. 1.23
+        #[arg(long, required_unless_present = "amount_units", conflicts_with = "amount_units")]
+        amount: Option<String>,
+
+        /// Transfer amount in raw smallest units
+        #[arg(long = "amount-units", required_unless_present = "amount", conflicts_with = "amount")]
+        amount_units: Option<u64>,
         
         /// Transfer type (flux/power/task)
         #[arg(long, default_value = "setu")]

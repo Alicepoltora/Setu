@@ -484,7 +484,8 @@ export VALIDATOR_HTTP_PORT=8080
 
 ```bash
 ./target/release/setu balance --address <ADDRESS>
-./target/release/setu transfer --from <FROM> --to <TO> --amount 100
+./target/release/setu transfer --from <FROM> --to <TO> --amount 1.23
+# For raw smallest units, use: --amount-units 123000000
 ```
 
 </details>

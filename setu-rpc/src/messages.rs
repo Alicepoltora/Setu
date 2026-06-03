@@ -234,7 +234,7 @@ pub struct SubmitTransferRequest {
     pub from: String,
     /// Receiver address
     pub to: String,
-    /// Amount to transfer (non-negative)
+    /// Amount to transfer in raw smallest units (non-negative)
     pub amount: u64,
     /// Transfer type (flux, instant, etc.)
     pub transfer_type: String,
