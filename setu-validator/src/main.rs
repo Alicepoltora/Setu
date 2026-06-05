@@ -576,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
                             if bytes.len() == 32 {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&bytes);
-                                gsm.record_modification(&genesis_event_id, arr);
+                                gsm.record_modification(&genesis_event_id, arr, 0);
                             }
                         }
                     }

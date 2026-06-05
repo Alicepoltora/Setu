@@ -130,6 +130,26 @@ pub trait StateProvider: Send + Sync {
     /// Used for deriving event dependencies from input objects.
     /// Returns None for genesis objects or if tracking is not available.
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String>;
+
+    /// Get the event ID that last modified an object together with the anchor
+    /// depth of the CF that finalized it.
+    ///
+    /// Used by TaskPreparer to drop cold parent edges that have aged past the
+    /// cross-CF depth window. The default implementation maps the plain
+    /// `get_last_modifying_event` to depth 0 (correct for test/mocks and the
+    /// genesis object); production `MerkleStateProvider` overrides it to read
+    /// the real recorded depth.
+    fn get_last_modifying_event_depth(&self, object_id: &ObjectId) -> Option<(String, u64)> {
+        self.get_last_modifying_event(object_id).map(|id| (id, 0))
+    }
+
+    /// Current finalized depth = anchor depth of the last applied CF.
+    ///
+    /// Sync, consensus-agreed proxy for the DAG depth floor used by the
+    /// cold-parent drop decision. Default 0 (no folding has happened).
+    fn current_finalized_depth(&self) -> u64 {
+        0
+    }
     
     /// Get object with its proof (convenience method)
     fn get_object_with_proof(&self, object_id: &ObjectId) -> Option<(Vec<u8>, SimpleMerkleProof)> {
@@ -492,6 +512,26 @@ impl StateProvider for MerkleStateProvider {
         // Fallback to local tracker (for backward compatibility)
         let tracker = self.modification_tracker.read().unwrap();
         tracker.get(object_id.as_bytes()).cloned()
+    }
+
+    fn get_last_modifying_event_depth(&self, object_id: &ObjectId) -> Option<(String, u64)> {
+        // GSM tracker is the production-authoritative source (carries depth).
+        {
+            let snapshot = self.shared.load_snapshot();
+            if let Some((event_id, depth)) =
+                snapshot.get_last_modifying_event_depth(object_id.as_bytes())
+            {
+                return Some((event_id.clone(), depth));
+            }
+        }
+        // Local fallback tracker is test-only in production and stores no depth;
+        // map any hit to depth 0.
+        let tracker = self.modification_tracker.read().unwrap();
+        tracker.get(object_id.as_bytes()).map(|id| (id.clone(), 0))
+    }
+
+    fn current_finalized_depth(&self) -> u64 {
+        self.shared.load_snapshot().last_finalized_depth()
     }
 
     fn get_object_from_subnet(&self, object_id: &ObjectId, subnet_id: &SubnetId) -> Option<Vec<u8>> {

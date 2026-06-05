@@ -634,16 +634,28 @@ impl BatchTaskPreparer {
         coin_object_id: &ObjectId,
         snapshot: &BatchStateSnapshot,
     ) -> Vec<String> {
-        // Drop the genesis parent edge (see single.rs::derive_dependencies and
-        // docs/feat/fix-transfer-parent-too-old/design.md): a never-moved coin
-        // references the depth-0 genesis event, which trips `ParentTooOld` once
-        // the depth floor advances past `max_cross_cf_depth`.
+        use super::COLD_PARENT_DROP_THRESHOLD;
+
+        // Mirror single.rs::derive_dependencies (see
+        // docs/feat/fix-transfer-parent-too-old-general/design.md):
+        // (1) drop the genesis edge unconditionally; (2) drop a cold non-genesis
+        // edge aged `floor − depth ≥ 150`. Floor is proxied by the snapshot's
+        // finalized_depth captured under the same lock.
         let genesis_id = Event::genesis_event_id();
-        snapshot
-            .get_last_modifying_event(coin_object_id)
-            .filter(|event_id| **event_id != genesis_id)
-            .map(|event_id| vec![event_id.clone()])
-            .unwrap_or_default()
+        let floor = snapshot.finalized_depth();
+
+        let Some((event_id, depth)) = snapshot.get_last_modifying_event_depth(coin_object_id)
+        else {
+            return Vec::new();
+        };
+
+        if *event_id == genesis_id {
+            return Vec::new();
+        }
+        if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+            return Vec::new();
+        }
+        vec![event_id.clone()]
     }
 
     /// Create Event from Transfer with pre-derived parent_ids
@@ -838,5 +850,92 @@ mod tests {
         // alice and bob are 2 unique senders (all in ROOT subnet)
         assert_eq!(result.stats.unique_sender_subnet_pairs, 2);
         assert_eq!(result.stats.coins_selected, 3);
+    }
+
+    // ---- Cold-parent drop (Approach C) ----------------------------------
+    //
+    // docs/feat/fix-transfer-parent-too-old-general/design.md §5: a parent
+    // edge is dropped at preparation time when it is the genesis event OR a
+    // non-genesis event aged `floor − depth ≥ COLD_PARENT_DROP_THRESHOLD`.
+
+    fn oid(tag: u8) -> ObjectId {
+        ObjectId::new([tag; 32])
+    }
+
+    #[test]
+    fn test_snapshot_keeps_recent_non_genesis_parent() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(1);
+        // floor 1000, parent at depth 900 → age 100 < 150 → keep.
+        let snapshot = BatchStateSnapshot::new_for_testing(
+            1000,
+            vec![(object, "event-recent".to_string(), 900)],
+        );
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert_eq!(parents, vec!["event-recent".to_string()]);
+    }
+
+    #[test]
+    fn test_snapshot_drops_aged_non_genesis_parent() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(2);
+        // floor 1000, parent at depth 800 → age 200 ≥ 150 → drop.
+        let snapshot = BatchStateSnapshot::new_for_testing(
+            1000,
+            vec![(object, "event-aged".to_string(), 800)],
+        );
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert!(parents.is_empty(), "aged parent must be dropped");
+    }
+
+    #[test]
+    fn test_snapshot_drop_boundary() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(3);
+        let threshold = super::super::COLD_PARENT_DROP_THRESHOLD;
+
+        // age == threshold-1 → keep.
+        let keep = BatchStateSnapshot::new_for_testing(
+            threshold + 99,
+            vec![(object, "boundary-keep".to_string(), 100)],
+        );
+        assert_eq!(
+            preparer.derive_dependencies_from_snapshot(&object, &keep),
+            vec!["boundary-keep".to_string()]
+        );
+
+        // age == threshold → drop.
+        let drop = BatchStateSnapshot::new_for_testing(
+            threshold + 100,
+            vec![(object, "boundary-drop".to_string(), 100)],
+        );
+        assert!(
+            preparer
+                .derive_dependencies_from_snapshot(&object, &drop)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_drops_genesis_parent_unconditionally() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(4);
+        let genesis = Event::genesis_event_id();
+        // Even with floor == depth (age 0) genesis is dropped.
+        let snapshot =
+            BatchStateSnapshot::new_for_testing(0, vec![(object, genesis, 0)]);
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert!(parents.is_empty(), "genesis parent must always be dropped");
+    }
+
+    #[test]
+    fn test_snapshot_no_modifier_returns_empty() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let snapshot = BatchStateSnapshot::new_for_testing(1000, vec![]);
+        let parents = preparer.derive_dependencies_from_snapshot(&oid(5), &snapshot);
+        assert!(parents.is_empty());
     }
 }

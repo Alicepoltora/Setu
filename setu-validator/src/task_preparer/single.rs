@@ -866,36 +866,65 @@ impl TaskPreparer {
     ///
     /// For each input object, find the last event that modified it.
     /// These events become the parent_ids (dependencies) of the new event.
+    ///
+    /// Two edges are dropped at preparation time (baked into the signed event,
+    /// so the dropped set is deterministic across nodes):
+    /// 1. The **genesis** edge (unconditional fast-path): a never-moved coin
+    ///    references the depth-0 genesis event, which trips `ParentTooOld` once
+    ///    the floor advances past `max_cross_cf_depth`.
+    /// 2. Any **cold** non-genesis edge whose modifying event has aged
+    ///    `floor − depth ≥ COLD_PARENT_DROP_THRESHOLD` (= 150): a long-idle coin
+    ///    moved once, went quiet, and its last modifier slid below the GC window.
+    ///
+    /// Double-spend safety is independent of these edges (enforced by the
+    /// `old_value` conflict check at apply time), so dropping them is safe.
+    /// See docs/feat/fix-transfer-parent-too-old-general/design.md.
     fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
+        use super::COLD_PARENT_DROP_THRESHOLD;
+
         let mut parent_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        // Drop the genesis parent edge: a coin that has never moved since
-        // genesis carries the genesis event id as its last modifier. Once the
-        // DAG depth floor advances past `max_cross_cf_depth`, that edge is
-        // rejected as `ParentTooOld`, blocking transfers of long-idle coins.
-        // Double-spend safety is independent of this edge (enforced by the
-        // `old_value` conflict check at apply time), so dropping it is safe.
-        // See docs/feat/fix-transfer-parent-too-old/design.md.
         let genesis_id = Event::genesis_event_id();
+        let floor = self.state_provider.current_finalized_depth();
 
         for object_id in input_objects {
-            if let Some(event_id) = self.state_provider.get_last_modifying_event(object_id) {
-                if event_id == genesis_id {
-                    debug!(
-                        object_id = %object_id,
-                        "Dropping genesis parent edge for never-moved coin"
-                    );
-                    continue;
-                }
-                // Deduplicate: same event might have modified multiple objects
-                if seen.insert(event_id.clone()) {
-                    debug!(
-                        object_id = %object_id,
-                        parent_event = %event_id,
-                        "Found dependency from input object"
-                    );
-                    parent_ids.push(event_id);
-                }
+            // Read (event_id, finalized_depth) together so the cold-parent
+            // decision uses the same recorded depth across all nodes.
+            let Some((event_id, depth)) =
+                self.state_provider.get_last_modifying_event_depth(object_id)
+            else {
+                continue;
+            };
+
+            // (1) Unconditional genesis drop (depth-0 constant, no aging check).
+            if event_id == genesis_id {
+                debug!(
+                    object_id = %object_id,
+                    "Dropping genesis parent edge for never-moved coin"
+                );
+                continue;
+            }
+
+            // (2) Cold non-genesis drop: aged past the cross-CF window proxy.
+            if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+                debug!(
+                    object_id = %object_id,
+                    parent_event = %event_id,
+                    parent_depth = depth,
+                    floor = floor,
+                    "Dropping cold parent edge (aged past cross-CF window)"
+                );
+                continue;
+            }
+
+            // Deduplicate: same event might have modified multiple objects
+            if seen.insert(event_id.clone()) {
+                debug!(
+                    object_id = %object_id,
+                    parent_event = %event_id,
+                    "Found dependency from input object"
+                );
+                parent_ids.push(event_id);
             }
         }
         

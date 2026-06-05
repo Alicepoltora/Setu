@@ -274,11 +274,21 @@ pub struct GlobalStateManager {
     /// efficient lookups for both Coins and Move objects.
     /// The type_tag is coin_type for legacy CoinState, or Move type_tag for ObjectEnvelope.
     owner_object_index: HashMap<String, HashSet<([u8; 32], String)>>,
-    /// Modification tracker: object_id -> last modifying event_id
+    /// Modification tracker: object_id -> (last modifying event_id, finalized depth)
     /// 
     /// Updated during apply_committed_events to track which event last modified
-    /// each object. Used by TaskPreparer to derive DAG parent_ids for causal ordering.
-    modification_tracker: HashMap<[u8; 32], String>,
+    /// each object AND the anchor depth of the CF that finalized it. Used by
+    /// TaskPreparer to derive DAG parent_ids for causal ordering and to drop
+    /// cold parent edges that have aged past the cross-CF window
+    /// (docs/feat/fix-transfer-parent-too-old-general/). In-memory only
+    /// (arch invariant #4) — rebuilt via DAG replay, never persisted.
+    modification_tracker: HashMap<[u8; 32], (String, u64)>,
+    /// Anchor depth of the most recently applied CF.
+    ///
+    /// Updated on every `apply_committed_events`. Serves as a sync, consensus-
+    /// agreed proxy for the DAG depth floor (`DagManager.min_depth`) so the
+    /// preparer can decide cold-parent drops without a consensus handle.
+    last_finalized_depth: u64,
     /// Optional version watcher (B1 wait_min_version API).
     ///
     /// When attached via [`set_version_watcher`](Self::set_version_watcher),
@@ -329,6 +339,9 @@ impl Clone for GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            // Scalar watermark — cheap to preserve and keeps a verify-clone's
+            // cold-parent view consistent with the source GSM.
+            last_finalized_depth: self.last_finalized_depth,
             // Clones are throw-away snapshots — wakeup notifications are scoped
             // to the canonical instance only.
             version_watcher: None,
@@ -363,6 +376,7 @@ impl GlobalStateManager {
             coin_type_index: self.coin_type_index.clone(),
             owner_object_index: self.owner_object_index.clone(),
             modification_tracker: self.modification_tracker.clone(),
+            last_finalized_depth: self.last_finalized_depth,
             // Read snapshots do not fire wakeups; the canonical instance owns
             // the watcher.
             version_watcher: None,
@@ -384,6 +398,7 @@ impl GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            last_finalized_depth: 0,
             version_watcher: None,
         }
     }
@@ -897,15 +912,34 @@ impl GlobalStateManager {
 
     /// Get the last event that modified a given object
     pub fn get_last_modifying_event(&self, object_id: &[u8; 32]) -> Option<&String> {
-        self.modification_tracker.get(object_id)
+        self.modification_tracker.get(object_id).map(|(id, _)| id)
     }
 
-    /// Record that an event modified specific objects
+    /// Get the last event that modified a given object together with the anchor
+    /// depth of the CF that finalized it.
+    ///
+    /// Used by TaskPreparer to drop cold parent edges that have aged past the
+    /// cross-CF window. Returns `None` for objects with no recorded modifier
+    /// (e.g. pre-restart coins before DAG replay repopulates the tracker).
+    pub fn get_last_modifying_event_depth(&self, object_id: &[u8; 32]) -> Option<(&String, u64)> {
+        self.modification_tracker
+            .get(object_id)
+            .map(|(id, depth)| (id, *depth))
+    }
+
+    /// Anchor depth of the most recently applied CF (sync floor proxy).
+    pub fn last_finalized_depth(&self) -> u64 {
+        self.last_finalized_depth
+    }
+
+    /// Record that an event modified a specific object at a given finalized depth
     /// 
-    /// This is called during genesis initialization and after state changes
-    /// are applied via apply_committed_events.
-    pub fn record_modification(&mut self, event_id: &str, object_id: [u8; 32]) {
-        self.modification_tracker.insert(object_id, event_id.to_string());
+    /// This is called during genesis initialization (depth 0) and after state
+    /// changes are applied via apply_committed_events (the finalizing CF's
+    /// anchor depth).
+    pub fn record_modification(&mut self, event_id: &str, object_id: [u8; 32], finalized_depth: u64) {
+        self.modification_tracker
+            .insert(object_id, (event_id.to_string(), finalized_depth));
     }
     
     // =========================================================================
@@ -1096,7 +1130,10 @@ impl GlobalStateManager {
     pub fn apply_committed_events(
         &mut self,
         events: &[Event],
+        finalized_depth: u64,
     ) -> StateApplySummary {
+        // Record the anchor depth of this finalizing CF as the sync floor proxy.
+        self.last_finalized_depth = self.last_finalized_depth.max(finalized_depth);
         // DIAG: mark this thread as "inside authoritative CF apply" so that
         // apply_state_change's out-of-band probe stays silent for every write
         // reached through this path. Drop unsets the gate on any exit
@@ -1248,10 +1285,13 @@ impl GlobalStateManager {
                 // Apply all state changes for this event
                 let new_root = self.apply_execution_result(subnet_id, result);
                 
-                // Update modification_tracker: record event_id for each modified object
+                // Update modification_tracker: record (event_id, finalized_depth)
+                // for each modified object. The depth is the finalizing CF's
+                // anchor depth, used later to drop cold parent edges.
                 for change in &result.state_changes {
                     let object_id = Self::parse_state_change_key(&change.key);
-                    self.modification_tracker.insert(*object_id.as_bytes(), event.id.clone());
+                    self.modification_tracker
+                        .insert(*object_id.as_bytes(), (event.id.clone(), finalized_depth));
                 }
                 
                 // Track in summary
@@ -1319,7 +1359,7 @@ impl GlobalStateManager {
         anchor_id: u64,
     ) -> Result<(AnchorMerkleRoots, StateApplySummary), StateApplyError> {
         // Apply all state changes
-        let summary = self.apply_committed_events(events);
+        let summary = self.apply_committed_events(events, anchor_id);
         
         // Build anchor roots
         let anchor_roots = self.build_anchor_roots(events_root, anchor_chain_root);
@@ -1744,7 +1784,7 @@ mod tests {
         event2.status = setu_types::event::EventStatus::Executed;
         
         // Apply both events (sorted by VLC: T1 first, then T2)
-        let summary = manager.apply_committed_events(&[event1.clone(), event2.clone()]);
+        let summary = manager.apply_committed_events(&[event1.clone(), event2.clone()], 0);
         
         // T1 should succeed
         assert_eq!(summary.total_events, 1, "Only T1 should be applied");
@@ -1812,7 +1852,7 @@ mod tests {
         });
         event2.status = setu_types::event::EventStatus::Executed;
         
-        let summary = manager.apply_committed_events(&[event1, event2]);
+        let summary = manager.apply_committed_events(&[event1, event2], 0);
         
         // Both should succeed - no conflicts
         assert_eq!(summary.total_events, 2);
@@ -1846,7 +1886,7 @@ mod tests {
         });
         event.status = setu_types::event::EventStatus::Executed;
         
-        let summary = manager.apply_committed_events(&[event]);
+        let summary = manager.apply_committed_events(&[event], 0);
         
         assert_eq!(summary.total_events, 1);
         assert!(summary.conflicted_events.is_empty());
@@ -1908,7 +1948,7 @@ mod tests {
         });
         t2.status = setu_types::event::EventStatus::Executed;
 
-        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()]);
+        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()], 0);
 
         assert_eq!(summary.total_events, 1, "Only T1 should commit");
         assert_eq!(summary.conflicted_events.len(), 1, "T2 must be rejected as concurrent-swap conflict");
@@ -1959,7 +1999,7 @@ mod tests {
         });
         t2.status = setu_types::event::EventStatus::Executed;
 
-        let summary = manager.apply_committed_events(&[t1, t2]);
+        let summary = manager.apply_committed_events(&[t1, t2], 0);
 
         assert_eq!(summary.total_events, 2, "Both events must commit");
         assert!(summary.conflicted_events.is_empty(),
