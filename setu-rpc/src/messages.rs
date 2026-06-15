@@ -242,10 +242,22 @@ pub struct SubmitTransferRequest {
     pub preferred_solver: Option<String>,
     /// Optional shard assignment
     pub shard_id: Option<String>,
-    /// Optional subnet ID for subnet-based routing
+    /// Optional subnet ID for subnet-based routing.
+    /// Boundary accepts public id or full hex; the signed user path forwards
+    /// the canonical form (design D1).
     pub subnet_id: Option<String>,
     /// Resources involved in this transfer
     pub resources: Vec<String>,
+    /// V2 client nonce, forwarded from the signed user path (design D4)
+    #[serde(default)]
+    pub client_nonce: Option<String>,
+    /// Chain id bound into the V2 signing domain (design D3)
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// Authorization metadata from the verified signed user path (design D5).
+    /// `None` for raw/admin transfers.
+    #[serde(default)]
+    pub authorization: Option<setu_types::TransferAuthorization>,
 }
 
 /// Response to transfer submission

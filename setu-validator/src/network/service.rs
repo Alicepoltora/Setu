@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 // Import API handlers
 use setu_api;
@@ -332,6 +332,11 @@ impl ValidatorNetworkService {
     /// Get the state provider (delegates to TaskPreparer)
     pub fn state_provider(&self) -> &Arc<dyn setu_storage::StateProvider> {
         self.task_preparer.state_provider()
+    }
+
+    /// Chain id bound into V2 signed-transfer messages (design D2.7)
+    pub fn chain_id(&self) -> &str {
+        &self.config.chain_id
     }
 
     /// Create an InfraExecutor using the shared MerkleStateProvider
@@ -1200,6 +1205,18 @@ impl ValidatorNetworkService {
         self.registered_subnets.get(subnet_id).map(|v| v.clone())
     }
 
+    /// Authoritative existence check by canonical `SubnetId` (design D7 /
+    /// R4-ISSUE-2). The registry DashMap is keyed by the public-id string, so
+    /// a raw-string lookup false-rejects subnets addressed by full hex; this
+    /// scans the (small) registry comparing canonical ids instead. No extra
+    /// index → no new G10 replay obligation.
+    pub fn get_subnet_info_by_canonical(&self, canonical: &setu_types::SubnetId) -> Option<SubnetInfo> {
+        self.registered_subnets
+            .iter()
+            .find(|entry| entry.value().canonical_id == *canonical)
+            .map(|entry| entry.value().clone())
+    }
+
     pub fn get_subnet_list(&self) -> Vec<setu_rpc::SubnetListItem> {
         self.registered_subnets
             .iter()
@@ -1249,10 +1266,19 @@ impl ValidatorNetworkService {
         // RouterManager still needs Transfer channel for routing decisions
         let (router_tx, _router_rx) = mpsc::unbounded_channel::<Transfer>();
         
-        // Parse permitted_subnets from hex strings
+        // Parse permitted_subnets with the shared resolver (design D1): public
+        // ids and full hex both accepted. Invalid entries are skipped (kept
+        // from the legacy filter_map behavior) but now logged instead of
+        // silently dropped.
         let permitted_subnets: Vec<setu_types::SubnetId> = request.permitted_subnets
             .iter()
-            .filter_map(|hex_str| setu_types::SubnetId::from_hex(hex_str).ok())
+            .filter_map(|s| match setu_types::SubnetId::parse_public_or_hex(s) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    warn!(input = %s, error = %e, "Skipping invalid permitted_subnets entry");
+                    None
+                }
+            })
             .collect();
         
         self.router_manager.register_solver_with_affinity(
@@ -2320,6 +2346,8 @@ mod tests {
 
     fn add_test_subnet(service: &ValidatorNetworkService, subnet_id: &str) {
         service.add_subnet(SubnetInfo {
+            canonical_id: setu_types::SubnetId::parse_public_or_hex(subnet_id)
+                .unwrap_or_else(|_| setu_types::SubnetId::from_str_id(subnet_id)),
             subnet_id: subnet_id.to_string(),
             name: "Test Subnet".to_string(),
             owner: "owner".to_string(),

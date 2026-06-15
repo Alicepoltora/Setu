@@ -190,21 +190,58 @@ impl ValidatorUserHandler {
         }
     }
 
-    fn canonical_transfer_message(
-        from: &str,
-        to: &str,
-        amount: u64,
-        coin_type: &str,
-        timestamp: u64,
+    /// V2 canonical signing message (design D3). Binds every authorization
+    /// axis: chain, normalized addresses, raw amount, canonical subnet,
+    /// client nonce, and timestamp. Variable-length fields carry length
+    /// prefixes; `subnet_canonical` is "ROOT" or full 0x+64-hex, never a
+    /// public id or short display form.
+    fn canonical_transfer_message_v2(
+        chain_id: &str,
+        normalized_from: &str,
+        normalized_to: &str,
+        amount_raw: u64,
+        subnet_canonical: &str,
+        client_nonce: &str,
+        timestamp_ms: u64,
     ) -> String {
         format!(
-            "Transfer SETU: from={};to={};amount={};coin_type={};timestamp={}",
-            from,
-            to,
-            amount,
-            coin_type,
-            timestamp
+            "SETU_TRANSFER_V2\n\
+             chain_id_len={};chain_id={}\n\
+             from_len={};from={}\n\
+             to_len={};to={}\n\
+             amount_raw={}\n\
+             subnet_id_len={};subnet_id={}\n\
+             client_nonce_len={};client_nonce={}\n\
+             timestamp_ms={}",
+            chain_id.len(), chain_id,
+            normalized_from.len(), normalized_from,
+            normalized_to.len(), normalized_to,
+            amount_raw,
+            subnet_canonical.len(), subnet_canonical,
+            client_nonce.len(), client_nonce,
+            timestamp_ms,
         )
+    }
+
+    /// Lowercase-normalize a user address for signing and marker derivation
+    fn normalize_address(address: &str) -> String {
+        address.to_lowercase()
+    }
+
+    /// Resolve the raw amount for a non-ROOT subnet transfer (design D6):
+    /// raw `amount` required, `display_amount` forbidden in this phase.
+    fn resolve_subnet_transfer_amount(request: &TransferRequest) -> Result<u64, String> {
+        if request.display_amount.is_some() {
+            return Err(
+                "display_amount is not supported for subnet token transfer; use raw amount units"
+                    .to_string(),
+            );
+        }
+        match request.amount {
+            Some(raw) if raw > 0 => Ok(raw),
+            Some(_) => Err("Transfer amount must be greater than zero".to_string()),
+            None => Err("Transfer amount (raw units) is required for subnet token transfer".to_string()),
+        }
     }
 }
 
@@ -213,19 +250,26 @@ mod tests {
     use super::ValidatorUserHandler;
     use setu_keys::{SetuKeyPair, SignatureScheme};
 
-    fn sign_for(
+    const TEST_CHAIN: &str = "setu-dev";
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_v2(
         keypair: &SetuKeyPair,
+        chain_id: &str,
         from: &str,
         to: &str,
         amount: u64,
-        coin_type: &str,
+        subnet_canonical: &str,
+        nonce: &str,
         timestamp: u64,
     ) -> (String, Vec<u8>) {
-        let message = ValidatorUserHandler::canonical_transfer_message(
-            from,
-            to,
+        let message = ValidatorUserHandler::canonical_transfer_message_v2(
+            chain_id,
+            &from.to_lowercase(),
+            &to.to_lowercase(),
             amount,
-            coin_type,
+            subnet_canonical,
+            nonce,
             timestamp,
         );
         let signature = keypair.sign(message.as_bytes());
@@ -234,20 +278,75 @@ mod tests {
         (message, signature_bytes)
     }
 
+    // Test #4 (design §9): V2 canonical message binds every authorization axis
     #[test]
-    fn transfer_canonical_message_binds_request_fields() {
-        let message = ValidatorUserHandler::canonical_transfer_message(
+    fn transfer_canonical_message_v2_binds_all_fields() {
+        let message = ValidatorUserHandler::canonical_transfer_message_v2(
+            "setu-dev",
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             42,
-            "setu",
+            "ROOT",
+            "nonce-0001",
             1778390000000,
         );
 
         assert_eq!(
             message,
-            "Transfer SETU: from=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;to=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb;amount=42;coin_type=setu;timestamp=1778390000000"
+            "SETU_TRANSFER_V2\n\
+             chain_id_len=8;chain_id=setu-dev\n\
+             from_len=66;from=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             to_len=66;to=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             amount_raw=42\n\
+             subnet_id_len=4;subnet_id=ROOT\n\
+             client_nonce_len=10;client_nonce=nonce-0001\n\
+             timestamp_ms=1778390000000"
         );
+    }
+
+    // Test #5 (design §9): tampering the subnet axis invalidates the signature
+    #[test]
+    fn transfer_v2_tampered_subnet_fails_signature() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let from = keypair.address().to_hex();
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let subnet = setu_types::SubnetId::from_str_id("gaming-subnet").canonical_string();
+        let other_subnet = setu_types::SubnetId::from_str_id("other-subnet").canonical_string();
+        let (_, signature) =
+            sign_v2(&keypair, TEST_CHAIN, &from, to, 7, &subnet, "nonce-0001", 1778390000000);
+
+        // The validator rebuilds the message with the request's subnet; if an
+        // attacker swaps the subnet, the rebuilt message no longer matches
+        // what was signed.
+        let tampered = ValidatorUserHandler::canonical_transfer_message_v2(
+            TEST_CHAIN, &from.to_lowercase(), &to.to_lowercase(), 7,
+            &other_subnet, "nonce-0001", 1778390000000,
+        );
+        let result = ValidatorUserHandler::verify_signature(
+            &from, &signature, &tampered, None, Some(&keypair.public().encode_base64()),
+        );
+        assert!(result.is_err(), "subnet tamper must invalidate the signature");
+    }
+
+    // Test #6 (design §9): tampering the amount axis invalidates the signature
+    #[test]
+    fn transfer_v2_tampered_amount_fails_signature() {
+        std::env::remove_var("SETU_SKIP_SIG_VERIFY");
+        let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
+        let from = keypair.address().to_hex();
+        let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (_, signature) =
+            sign_v2(&keypair, TEST_CHAIN, &from, to, 7, "ROOT", "nonce-0001", 1778390000000);
+
+        let tampered = ValidatorUserHandler::canonical_transfer_message_v2(
+            TEST_CHAIN, &from.to_lowercase(), &to.to_lowercase(), 700,
+            "ROOT", "nonce-0001", 1778390000000,
+        );
+        let result = ValidatorUserHandler::verify_signature(
+            &from, &signature, &tampered, None, Some(&keypair.public().encode_base64()),
+        );
+        assert!(result.is_err(), "amount tamper must invalidate the signature");
     }
 
     #[test]
@@ -256,7 +355,8 @@ mod tests {
         let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
         let from = keypair.address().to_hex();
         let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let (message, signature) = sign_for(&keypair, &from, to, 7, "setu", 1778390000000);
+        let (message, signature) =
+            sign_v2(&keypair, TEST_CHAIN, &from, to, 7, "ROOT", "nonce-0001", 1778390000000);
 
         let result = ValidatorUserHandler::verify_signature(
             &from,
@@ -275,7 +375,8 @@ mod tests {
         let keypair = SetuKeyPair::generate(SignatureScheme::ED25519);
         let wrong_from = "0x3333333333333333333333333333333333333333333333333333333333333333";
         let to = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let (message, signature) = sign_for(&keypair, wrong_from, to, 7, "setu", 1778390000000);
+        let (message, signature) =
+            sign_v2(&keypair, TEST_CHAIN, wrong_from, to, 7, "ROOT", "nonce-0001", 1778390000000);
 
         let result = ValidatorUserHandler::verify_signature(
             wrong_from,
@@ -288,22 +389,28 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn transfer_amount_accepts_raw_units() {
-        let request = setu_rpc::TransferRequest {
+    fn base_request() -> setu_rpc::TransferRequest {
+        setu_rpc::TransferRequest {
             from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             amount: Some(123_000_000),
             display_amount: None,
             coin_type: Some("setu".to_string()),
+            subnet_id: None,
+            client_nonce: Some("nonce-0001".to_string()),
+            chain_id: Some(TEST_CHAIN.to_string()),
             memo: None,
             message: None,
             timestamp: 1778390000000,
             signature: None,
             public_key: None,
             nostr_pubkey: None,
-        };
+        }
+    }
 
+    #[test]
+    fn transfer_amount_accepts_raw_units() {
+        let request = base_request();
         assert_eq!(
             ValidatorUserHandler::resolve_transfer_amount(&request, "setu"),
             Ok(123_000_000)
@@ -312,20 +419,9 @@ mod tests {
 
     #[test]
     fn transfer_amount_accepts_setu_display_amount() {
-        let request = setu_rpc::TransferRequest {
-            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            amount: None,
-            display_amount: Some("1.23".to_string()),
-            coin_type: Some("setu".to_string()),
-            memo: None,
-            message: None,
-            timestamp: 1778390000000,
-            signature: None,
-            public_key: None,
-            nostr_pubkey: None,
-        };
-
+        let mut request = base_request();
+        request.amount = None;
+        request.display_amount = Some("1.23".to_string());
         assert_eq!(
             ValidatorUserHandler::resolve_transfer_amount(&request, "setu"),
             Ok(123_000_000)
@@ -334,20 +430,9 @@ mod tests {
 
     #[test]
     fn transfer_amount_rejects_raw_display_mismatch() {
-        let request = setu_rpc::TransferRequest {
-            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            amount: Some(120_000_000),
-            display_amount: Some("1.23".to_string()),
-            coin_type: Some("setu".to_string()),
-            memo: None,
-            message: None,
-            timestamp: 1778390000000,
-            signature: None,
-            public_key: None,
-            nostr_pubkey: None,
-        };
-
+        let mut request = base_request();
+        request.amount = Some(120_000_000);
+        request.display_amount = Some("1.23".to_string());
         let error = ValidatorUserHandler::resolve_transfer_amount(&request, "setu")
             .expect_err("mismatched amount forms must be rejected");
         assert!(error.contains("do not match"));
@@ -355,20 +440,8 @@ mod tests {
 
     #[test]
     fn transfer_amount_rejects_non_setu_raw_amount() {
-        let request = setu_rpc::TransferRequest {
-            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            amount: Some(123_000_000),
-            display_amount: None,
-            coin_type: Some("game".to_string()),
-            memo: None,
-            message: None,
-            timestamp: 1778390000000,
-            signature: None,
-            public_key: None,
-            nostr_pubkey: None,
-        };
-
+        let mut request = base_request();
+        request.coin_type = Some("game".to_string());
         let error = ValidatorUserHandler::resolve_transfer_amount(&request, "game")
             .expect_err("non-SETU raw amount must be rejected in SETU-only user transfer path");
         assert!(error.contains("SETU only"));
@@ -376,23 +449,160 @@ mod tests {
 
     #[test]
     fn transfer_amount_rejects_non_setu_display_amount() {
-        let request = setu_rpc::TransferRequest {
-            from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            amount: None,
-            display_amount: Some("1.23".to_string()),
-            coin_type: Some("game".to_string()),
-            memo: None,
-            message: None,
-            timestamp: 1778390000000,
-            signature: None,
-            public_key: None,
-            nostr_pubkey: None,
-        };
-
+        let mut request = base_request();
+        request.amount = None;
+        request.display_amount = Some("1.23".to_string());
+        request.coin_type = Some("game".to_string());
         let error = ValidatorUserHandler::resolve_transfer_amount(&request, "game")
             .expect_err("non-SETU display amount must be rejected in first implementation");
         assert!(error.contains("SETU only"));
+    }
+
+    // ---- Full admission-flow tests (#7, #8, #9, #20) ----
+
+    fn create_test_handler() -> ValidatorUserHandler {
+        let service = std::sync::Arc::new(crate::ValidatorNetworkService::new(
+            "test-validator".to_string(),
+            std::sync::Arc::new(crate::RouterManager::new()),
+            std::sync::Arc::new(crate::TaskPreparer::new_for_testing("test-validator".to_string())),
+            std::sync::Arc::new(crate::BatchTaskPreparer::new_for_testing(
+                "test-validator".to_string(),
+            )),
+            crate::NetworkServiceConfig::default(),
+        ));
+        ValidatorUserHandler::new(service)
+    }
+
+    fn register_test_subnet(handler: &ValidatorUserHandler, public_id: &str) {
+        let registration = setu_types::registration::SubnetRegistration::new(
+            public_id.to_string(),
+            public_id.to_string(),
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+            "TST".to_string(),
+        );
+        handler.network_service.add_subnet(
+            crate::network::SubnetInfo::from_registration(&registration, 1_778_390_000_000),
+        );
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    // Test #7 (design §9): missing client_nonce fails
+    #[tokio::test]
+    async fn transfer_v2_missing_nonce_rejected() {
+        use setu_rpc::UserRpcHandler;
+        let handler = create_test_handler();
+        let mut request = base_request();
+        request.client_nonce = None;
+        request.timestamp = now_ms();
+
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(response.message.contains("client_nonce is required"), "{}", response.message);
+    }
+
+    // Test #8 (design §9): display_amount on a subnet transfer fails
+    #[tokio::test]
+    async fn transfer_v2_subnet_display_amount_rejected() {
+        use setu_rpc::UserRpcHandler;
+        let handler = create_test_handler();
+        register_test_subnet(&handler, "gaming-subnet");
+
+        let mut request = base_request();
+        request.subnet_id = Some("gaming-subnet".to_string());
+        request.coin_type = None;
+        request.amount = None;
+        request.display_amount = Some("1.23".to_string());
+        request.timestamp = now_ms();
+
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(
+            response.message.contains("display_amount is not supported"),
+            "{}",
+            response.message
+        );
+    }
+
+    // Test #9 (design §9): coin_type combined with a non-ROOT subnet fails
+    #[tokio::test]
+    async fn transfer_v2_subnet_with_coin_type_rejected() {
+        use setu_rpc::UserRpcHandler;
+        let handler = create_test_handler();
+        register_test_subnet(&handler, "gaming-subnet");
+
+        let mut request = base_request();
+        request.subnet_id = Some("gaming-subnet".to_string());
+        request.coin_type = Some("game".to_string());
+        request.timestamp = now_ms();
+
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(
+            response.message.contains("coin_type must be omitted"),
+            "{}",
+            response.message
+        );
+    }
+
+    // Test #20 (design §9): existence check works by canonical id — the
+    // full-hex form of a registered public id passes the registry gate, while
+    // a phantom (typo) public id resolves but fails it.
+    #[tokio::test]
+    async fn transfer_v2_subnet_existence_checked_by_canonical_id() {
+        use setu_rpc::UserRpcHandler;
+        let handler = create_test_handler();
+        register_test_subnet(&handler, "gaming-subnet");
+
+        // Full-hex addressing of the registered subnet: passes the registry
+        // gate and proceeds to the signed-message requirement (a later check),
+        // proving admission did not false-reject the hex form.
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet").canonical_string();
+        let mut request = base_request();
+        request.subnet_id = Some(canonical);
+        request.coin_type = None;
+        request.timestamp = now_ms();
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(
+            response.message.contains("Signed message is required"),
+            "full-hex form must pass the registry check; got: {}",
+            response.message
+        );
+
+        // Phantom subnet: resolves to a well-formed SubnetId but is not
+        // registered — admission fails closed at the registry gate.
+        let mut request = base_request();
+        request.subnet_id = Some("gaming-subnte".to_string());
+        request.coin_type = None;
+        request.timestamp = now_ms();
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(
+            response.message.contains("Unknown subnet"),
+            "phantom subnet must fail the registry check; got: {}",
+            response.message
+        );
+    }
+
+    // Invalid subnet grammar is rejected at resolution (D1 rule 4)
+    #[tokio::test]
+    async fn transfer_v2_invalid_subnet_grammar_rejected() {
+        use setu_rpc::UserRpcHandler;
+        let handler = create_test_handler();
+        let mut request = base_request();
+        request.subnet_id = Some("Bad_Subnet!".to_string());
+        request.coin_type = None;
+        request.timestamp = now_ms();
+
+        let response = handler.transfer(request).await;
+        assert!(!response.success);
+        assert!(response.message.contains("Invalid subnet_id"), "{}", response.message);
     }
 
     #[test]
@@ -677,7 +887,21 @@ impl UserRpcHandler for ValidatorUserHandler {
     async fn get_balance(&self, request: GetBalanceRequest) -> GetBalanceResponse {
         info!(address = %request.address, "Getting balance");
 
-        let coins = self.network_service.state_provider().get_coins_for_address(&request.address);
+        // Subnet filter (design D11): resolve canonically and filter by
+        // SubnetId compare, not by coin_type string matching.
+        let coins = match request.subnet_id.as_deref() {
+            Some(s) => match setu_types::SubnetId::parse_public_or_hex(s) {
+                Ok(subnet) => self
+                    .network_service
+                    .state_provider()
+                    .get_coins_for_address_in_subnet(&request.address, &subnet),
+                Err(_) => Vec::new(), // invalid subnet → no balances, not ROOT fallback
+            },
+            None => self
+                .network_service
+                .state_provider()
+                .get_coins_for_address(&request.address),
+        };
 
         // Aggregate by coin_type
         let mut type_map: std::collections::HashMap<String, (u64, u32)> = std::collections::HashMap::new();
@@ -780,48 +1004,97 @@ impl UserRpcHandler for ValidatorUserHandler {
     }
     
     async fn transfer(&self, request: TransferRequest) -> TransferResponse {
-        let coin_type = request
-            .coin_type
-            .clone()
-            .unwrap_or_else(|| "setu".to_string())
-            .to_lowercase();
-        let amount_units = match Self::resolve_transfer_amount(&request, &coin_type) {
-            Ok(amount) => amount,
-            Err(e) => return Self::transfer_err(&e),
-        };
-
-        info!(
-            from = %request.from,
-            to = %request.to,
-            amount = amount_units,
-            "Processing transfer request"
-        );
-
+        // --- Address validation + normalization (D3.1) ---
         if !Self::is_user_address(&request.from) {
             return Self::transfer_err(
                 "Invalid from address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
             );
         }
-
         if !Self::is_user_address(&request.to) {
             return Self::transfer_err(
                 "Invalid to address format: expected 0x + 64 hex (Setu) or 0x + 40 hex (Ethereum)",
             );
         }
+        let normalized_from = Self::normalize_address(&request.from);
+        let normalized_to = Self::normalize_address(&request.to);
 
+        // --- Subnet resolution (D1): fallible, no ROOT fallback ---
+        let subnet_id = match request.subnet_id.as_deref() {
+            None => setu_types::SubnetId::ROOT,
+            Some(s) => match setu_types::SubnetId::parse_public_or_hex(s) {
+                Ok(id) => id,
+                Err(e) => return Self::transfer_err(&format!("Invalid subnet_id: {}", e)),
+            },
+        };
+        let subnet_canonical = subnet_id.canonical_string();
+
+        // --- Amount + namespace rules (D2/D6) ---
+        let amount_units = if subnet_id.is_root() {
+            let coin_type = request
+                .coin_type
+                .clone()
+                .unwrap_or_else(|| "setu".to_string())
+                .to_lowercase();
+            match Self::resolve_transfer_amount(&request, &coin_type) {
+                Ok(amount) => amount,
+                Err(e) => return Self::transfer_err(&e),
+            }
+        } else {
+            // D2.5: token symbols are not execution namespaces
+            if request.coin_type.is_some() {
+                return Self::transfer_err(
+                    "coin_type must be omitted for subnet token transfer; the subnet_id determines the token",
+                );
+            }
+            // D7: fail closed on unregistered subnets, checked by canonical id
+            if self.network_service.get_subnet_info_by_canonical(&subnet_id).is_none() {
+                return Self::transfer_err("Unknown subnet: not registered or not active");
+            }
+            match Self::resolve_subnet_transfer_amount(&request) {
+                Ok(amount) => amount,
+                Err(e) => return Self::transfer_err(&e),
+            }
+        };
         if amount_units == 0 {
             return Self::transfer_err("Transfer amount must be greater than zero");
         }
 
+        // --- V2 nonce + chain binding (D2.6/D2.7) ---
+        let client_nonce = match request.client_nonce.as_deref() {
+            Some(nonce) => match crate::user_transfer_nonce::validate_client_nonce(nonce) {
+                Ok(()) => nonce.to_string(),
+                Err(e) => return Self::transfer_err(&e),
+            },
+            None => return Self::transfer_err("client_nonce is required for V2 signed transfer"),
+        };
+        let chain_id = self.network_service.chain_id().to_string();
+        match request.chain_id.as_deref() {
+            Some(c) if c == chain_id => {}
+            Some(_) => return Self::transfer_err("chain_id does not match this validator's chain"),
+            None => return Self::transfer_err("chain_id is required for V2 signed transfer"),
+        }
+
+        // --- Freshness window (D3.5: not the replay defense) ---
         if let Err(e) = Self::check_timestamp(request.timestamp) {
             return Self::transfer_err(&e);
         }
 
-        let expected_message = Self::canonical_transfer_message(
-            &request.from,
-            &request.to,
+        info!(
+            from = %request.from,
+            to = %request.to,
+            amount = amount_units,
+            subnet = %subnet_canonical,
+            "Processing V2 transfer request"
+        );
+
+        // --- Canonical V2 message + signature (D3) ---
+        let expected_message = Self::canonical_transfer_message_v2(
+            &chain_id,
+            &normalized_from,
+            &normalized_to,
             amount_units,
-            &coin_type,
+            &subnet_canonical,
+            &client_nonce,
             request.timestamp,
         );
         let message = match request.message.as_deref() {
@@ -836,7 +1109,6 @@ impl UserRpcHandler for ValidatorUserHandler {
             Some(signature) if !signature.is_empty() => signature,
             _ => return Self::transfer_err("Signature is required for transfer"),
         };
-
         if let Err(e) = Self::verify_signature(
             &request.from,
             signature,
@@ -847,22 +1119,44 @@ impl UserRpcHandler for ValidatorUserHandler {
             warn!(from = %request.from, error = %e, "Transfer signature verification failed");
             return Self::transfer_err(&e);
         }
-        
-        // Convert to SubmitTransferRequest
+
+        // --- Durable anti-replay precheck (D4 rule 1, overlay-merged view).
+        // Best-effort early rejection; the authoritative gate is the apply
+        // conflict check on the marker create.
+        let marker_id =
+            crate::user_transfer_nonce::nonce_object_id(&normalized_from, &client_nonce);
+        if self.network_service.state_provider().get_object(&marker_id).is_some() {
+            return Self::transfer_err(
+                "Duplicate client_nonce: this transfer authorization was already consumed",
+            );
+        }
+
+        // --- Authorization payload (D5, minimal mandatory set) ---
+        let digest = crate::user_transfer_nonce::request_digest(&expected_message);
+        let authorization = setu_types::TransferAuthorization::new(
+            normalized_from.clone(),
+            client_nonce.clone(),
+            digest,
+        );
+
+        // Forward the canonical subnet id (D1); no local side effects before
+        // DAG submission succeeds or fails inside submit_transfer.
         let submit_request = SubmitTransferRequest {
             from: request.from,
             to: request.to,
             amount: amount_units,
-            transfer_type: coin_type,
+            transfer_type: "setu".to_string(),
             resources: vec![],
             preferred_solver: None,
             shard_id: None,
-            subnet_id: None,
+            subnet_id: Some(subnet_canonical),
+            client_nonce: Some(client_nonce),
+            chain_id: Some(chain_id),
+            authorization: Some(authorization),
         };
-        
-        // Use existing transfer submission logic
+
         let response = self.network_service.submit_transfer(submit_request).await;
-        
+
         TransferResponse {
             success: response.success,
             message: response.message,

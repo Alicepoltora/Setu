@@ -137,6 +137,11 @@ pub struct GetBalanceRequest {
     pub address: String,
     /// Optional coin type filter (None = all types)
     pub coin_type: Option<String>,
+    /// Optional subnet filter: public id or full 0x+64-hex (design D11).
+    /// Resolved canonically; takes precedence over `coin_type` string
+    /// matching for subnet native tokens.
+    #[serde(default)]
+    pub subnet_id: Option<String>,
 }
 
 /// Balance information for a coin type
@@ -310,7 +315,22 @@ pub struct TransferRequest {
     #[serde(default)]
     pub display_amount: Option<String>,
     /// Coin type (default: "SETU")
+    ///
+    /// DEPRECATED for signed transfer execution (design D2.5): the execution
+    /// namespace is `subnet_id`. Rejected when combined with a non-ROOT subnet.
     pub coin_type: Option<String>,
+    /// Target subnet: public id (e.g. "gaming-subnet") or full 0x+64-hex.
+    /// Omitted/"ROOT" means SETU on the root subnet. Required for subnet
+    /// token transfer (raw `amount` units only in this phase).
+    #[serde(default)]
+    pub subnet_id: Option<String>,
+    /// Per-sender idempotency key for V2 signed transfers (design D4):
+    /// 8-128 chars of [A-Za-z0-9._:-], unique per sender, no ordering.
+    #[serde(default)]
+    pub client_nonce: Option<String>,
+    /// Chain id bound into the V2 signing domain (design D3)
+    #[serde(default)]
+    pub chain_id: Option<String>,
     /// Optional memo/note
     pub memo: Option<String>,
     /// Canonical signed transfer message

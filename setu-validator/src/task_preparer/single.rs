@@ -122,28 +122,22 @@ impl TaskPreparer {
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
         let amount = transfer.amount;
-        
-        // Use subnet_id as the coin namespace (1:1 binding)
-        // For ROOT subnet, use "ROOT" as the identifier
-        let subnet_id_str = if subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        };
-        
+
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            subnet_id = %subnet_id_str,
+            subnet_id = %subnet_id.canonical_string(),
             "Preparing SolverTask for transfer"
         );
-        
-        // Step 1: Select coins for sender filtered by subnet_id
-        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+
+        // Step 1: Select sender coins by canonical subnet compare (design
+        // D8.2): coin namespace identity is the resolved SubnetId, never a
+        // string match against a display form.
+        let sender_coins = self.state_provider.get_coins_for_address_in_subnet(
             &transfer.from,
-            &subnet_id_str,
+            &subnet_id,
         );
         let selection = self.select_coins_for_transfer(&sender_coins, amount)?;
 
@@ -193,11 +187,11 @@ impl TaskPreparer {
         // Step 4: Build read_set with Merkle proof
         // Pass raw storage data (CoinState) so TEE can verify Merkle proof
         // TEE is responsible for converting CoinState → Object<CoinData>
-        let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+        let coin_data = self.state_provider.get_object_from_subnet(&selected_coin.object_id, &subnet_id)
             .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
-        
-        let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
-        
+
+        let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(&selected_coin.object_id, &subnet_id);
+
         let mut read_set = vec![
             ReadSetEntry::new(
                 format!("oid:{}", hex::encode(&selected_coin.object_id)),
@@ -238,7 +232,7 @@ impl TaskPreparer {
         }
         
         // Step 5: Create Event from Transfer with derived dependencies
-        let event = self.create_event_from_transfer(transfer, parent_ids)?;
+        let event = self.create_event_from_transfer(transfer, parent_ids, subnet_id)?;
         
         // Step 6: Get pre-state root
         let pre_state_root = self.state_provider.get_state_root();
@@ -291,32 +285,25 @@ impl TaskPreparer {
         reservation_mgr: &crate::coin_reservation::CoinReservationManager,
     ) -> Result<(SolverTask, Vec<crate::coin_reservation::ReservationHandle>), TaskPrepareError> {
         let amount = transfer.amount;
-        
-        // Use subnet_id as the coin namespace (1:1 binding)
-        let subnet_id_str = if subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        };
-        
+
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            subnet_id = %subnet_id_str,
+            subnet_id = %subnet_id.canonical_string(),
             "Preparing SolverTask with reservation"
         );
-        
-        // Step 1: Get all coins for sender filtered by subnet_id
-        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+
+        // Step 1: Select sender coins by canonical subnet compare (design D8.2)
+        let sender_coins = self.state_provider.get_coins_for_address_in_subnet(
             &transfer.from,
-            &subnet_id_str,
+            &subnet_id,
         );
-        
+
         if sender_coins.is_empty() {
             return Err(TaskPrepareError::NoCoinsFound(
-                format!("sender {} has no coins in subnet {}", transfer.from, subnet_id_str)
+                format!("sender {} has no coins in subnet {}", transfer.from, subnet_id.canonical_string())
             ));
         }
 
@@ -369,9 +356,9 @@ impl TaskPreparer {
                 let input_objects: Vec<&setu_types::ObjectId> = vec![&selected_coin.object_id];
                 let parent_ids = self.derive_dependencies(&input_objects);
 
-                let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+                let coin_data = self.state_provider.get_object_from_subnet(&selected_coin.object_id, &subnet_id)
                     .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
-                let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
+                let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(&selected_coin.object_id, &subnet_id);
                 let mut read_set = vec![
                     setu_types::task::ReadSetEntry::new(
                         format!("oid:{}", hex::encode(&selected_coin.object_id)),
@@ -411,7 +398,7 @@ impl TaskPreparer {
                     ));
                 }
 
-                let event = self.create_event_from_transfer(transfer, parent_ids)?;
+                let event = self.create_event_from_transfer(transfer, parent_ids, subnet_id)?;
                 let pre_state_root = self.state_provider.get_state_root();
                 let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
 
@@ -502,7 +489,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&all_ids)?;
+        let read_set = self.build_read_set(&all_ids, &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -515,6 +502,7 @@ impl TaskPreparer {
             target_coin_id: hex::encode(&target_coin.object_id),
             source_coin_ids: source_coins.iter().map(|c| hex::encode(&c.object_id)).collect(),
         };
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -571,7 +559,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = vec![&source_coin.object_id];
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&[source_coin.object_id])?;
+        let read_set = self.build_read_set(&[source_coin.object_id], &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -584,6 +572,7 @@ impl TaskPreparer {
             source_coin_id: hex::encode(&source_coin.object_id),
             amounts,
         };
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -654,7 +643,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&all_ids)?;
+        let read_set = self.build_read_set(&all_ids, &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -669,6 +658,8 @@ impl TaskPreparer {
             recipient: recipient.to_string(),
             amount,
         };
+        // Mandatory on BOTH transfer prep paths (design D8.7, R4-ISSUE-4)
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -688,15 +679,18 @@ impl TaskPreparer {
     }
 
     /// Build read_set entries for a list of object IDs.
+    ///
+    /// Object bytes and proof are read from the same subnet SMT (design D8.3/D8.4).
     fn build_read_set(
         &self,
         object_ids: &[ObjectId],
+        subnet_id: &SubnetId,
     ) -> Result<Vec<ReadSetEntry>, TaskPrepareError> {
         let mut read_set = Vec::with_capacity(object_ids.len());
         for oid in object_ids {
-            let coin_data = self.state_provider.get_object(oid)
+            let coin_data = self.state_provider.get_object_from_subnet(oid, subnet_id)
                 .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(oid)))?;
-            let merkle_proof = self.state_provider.get_merkle_proof(oid);
+            let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(oid, subnet_id);
             read_set.push(
                 ReadSetEntry::new(
                     format!("oid:{}", hex::encode(oid)),
@@ -819,6 +813,7 @@ impl TaskPreparer {
         &self,
         transfer: &setu_types::Transfer,
         parent_ids: Vec<String>,
+        subnet_id: SubnetId,
     ) -> Result<Event, TaskPrepareError> {
         // Use the VLC assigned by Validator (from transfer) to ensure unique event_id
         // If no assigned_vlc, fall back to timestamp-based VLC (but this shouldn't happen in production)
@@ -855,10 +850,16 @@ impl TaskPreparer {
             vlc_snapshot,
             self.validator_id.clone(),
         );
-        
+
         // Attach transfer data (clone it)
         event = event.with_transfer(transfer.clone());
-        
+
+        // Mandatory (design D8.7/D9.3, R4-ISSUE-4): the apply fallback for a
+        // change without target_subnet is event.get_subnet_id(), which
+        // defaults to ROOT — an unset event subnet silently routes subnet
+        // coins into ROOT.
+        event = event.with_subnet(subnet_id);
+
         Ok(event)
     }
     
@@ -1852,6 +1853,89 @@ mod tests {
         fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
             self.last_modifier.get(object_id).cloned()
         }
+    }
+
+    /// Fresh (non-singleton) provider with subnet-native coins for alice,
+    /// stored in the app subnet SMT under the public-id coin_type.
+    fn make_subnet_provider(
+        public_id: &str,
+        total_balance: u64,
+        num_coins: u32,
+    ) -> Arc<setu_storage::MerkleStateProvider> {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider, init_coins_split};
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut manager = shared.lock_write();
+            init_coins_split(&mut manager, "alice", total_balance, num_coins, public_id);
+            shared.publish_snapshot(&manager);
+        }
+        Arc::new(MerkleStateProvider::new(shared))
+    }
+
+    // Test #13 (design §9): coin stored under public-id coin_type is selected
+    // via full-hex input through canonical compare; coin bytes + proof come
+    // from the subnet SMT, not from string equality against a display form.
+    #[test]
+    fn test_prepare_transfer_selects_subnet_coin_via_canonical_compare() {
+        let provider = make_subnet_provider("gaming-subnet", 500, 1);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet");
+        let transfer = Transfer::new("tx-subnet-1", "alice", "bob", 100)
+            .with_subnet(canonical.to_full_hex()); // full-hex addressing
+        let subnet_id = transfer.resolve_subnet_id().unwrap();
+        assert_eq!(subnet_id, canonical);
+
+        let task = preparer
+            .prepare_transfer_task(&transfer, subnet_id)
+            .expect("subnet coin must be selected via canonical compare");
+
+        assert_eq!(task.subnet_id, canonical);
+        // Coin read came from the subnet SMT and carries a proof
+        let coin_entry = &task.read_set[0];
+        assert!(coin_entry.key.starts_with("oid:"));
+        assert!(!coin_entry.value.is_empty());
+        assert!(
+            coin_entry.proof.as_ref().is_some_and(|p| !p.is_empty()),
+            "subnet proof must be present"
+        );
+    }
+
+    // Test #14 (design §9): event.subnet_id is set on BOTH the direct path
+    // and the CoinMergeThenTransfer path (R4-ISSUE-4).
+    #[test]
+    fn test_event_subnet_set_on_direct_and_merge_paths() {
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet");
+
+        // Direct path: one coin covers the amount
+        let provider = make_subnet_provider("gaming-subnet", 500, 1);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+        let transfer = Transfer::new("tx-direct", "alice", "bob", 100)
+            .with_subnet("gaming-subnet");
+        let task = preparer
+            .prepare_transfer_task(&transfer, transfer.resolve_subnet_id().unwrap())
+            .expect("direct transfer prep");
+        assert_eq!(
+            task.event.subnet_id,
+            Some(canonical),
+            "direct path must set event.subnet_id"
+        );
+
+        // Merge path: split alice's balance into 5 coins so no single coin
+        // covers the amount → auto-escalates to CoinMergeThenTransfer
+        let provider = make_subnet_provider("gaming-subnet", 250, 5);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+        let transfer = Transfer::new("tx-merge", "alice", "bob", 120)
+            .with_subnet("gaming-subnet");
+        let task = preparer
+            .prepare_transfer_task(&transfer, transfer.resolve_subnet_id().unwrap())
+            .expect("merge-then-transfer prep");
+        assert_eq!(task.event.event_type, EventType::CoinMergeThenTransfer);
+        assert_eq!(
+            task.event.subnet_id,
+            Some(canonical),
+            "CoinMergeThenTransfer path must set event.subnet_id"
+        );
     }
 
     /// The genesis parent edge must be dropped (it is depth-0 and trips

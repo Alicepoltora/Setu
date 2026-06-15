@@ -70,10 +70,38 @@ impl std::fmt::Display for SubnetType {
     }
 }
 
+/// Error for structurally-impossible subnet identifier strings.
+///
+/// Resolution is otherwise total: any string passing the registration grammar
+/// hashes to a valid APP id via `from_str_id`. This error only covers inputs
+/// that could never name a registered subnet. Fail-closed admission is the
+/// registry existence check, not this error (design D1/R4-ISSUE-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubnetIdParseError {
+    /// Empty or whitespace-only input
+    Empty,
+    /// Looked like 64-char hex but failed to decode
+    InvalidHex(&'static str),
+    /// Violates the public-id registration grammar
+    InvalidGrammar(&'static str),
+}
+
+impl fmt::Display for SubnetIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubnetIdParseError::Empty => write!(f, "subnet id must not be empty"),
+            SubnetIdParseError::InvalidHex(msg) => write!(f, "invalid subnet hex id: {}", msg),
+            SubnetIdParseError::InvalidGrammar(msg) => write!(f, "invalid subnet public id: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for SubnetIdParseError {}
+
 /// Unique identifier for a subnet (32 bytes)
-/// 
+///
 /// # Encoding
-/// 
+///
 /// SubnetId uses first byte as type marker:
 /// - `0x00`: ROOT subnet (all zeros)
 /// - `0x01`: System reserved subnets
@@ -168,6 +196,77 @@ impl SubnetId {
         Ok(Self(arr))
     }
     
+    /// Validate a string against the public subnet id registration grammar:
+    /// trimmed, 3-64 chars, `[a-z0-9-]`, alphanumeric first/last, excluding
+    /// reserved `root`/`governance`. Single source of truth shared by the
+    /// resolver below and `setu-validator` registration (design D1.5).
+    pub fn validate_public_id_grammar(raw: &str) -> Result<(), &'static str> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err("Invalid subnet_id: must not be empty");
+        }
+        if value != raw {
+            return Err("Invalid subnet_id: leading/trailing whitespace is not allowed");
+        }
+        if value.len() < 3 || value.len() > 64 {
+            return Err("Invalid subnet_id: length must be 3-64 characters");
+        }
+        if value.eq_ignore_ascii_case("root") || value.eq_ignore_ascii_case("governance") {
+            return Err("Invalid subnet_id: reserved system id");
+        }
+        let first = value.chars().next().unwrap();
+        let last = value.chars().last().unwrap();
+        if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+            return Err("Invalid subnet_id: must start and end with a letter or digit");
+        }
+        if !value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        {
+            return Err("Invalid subnet_id: only lowercase letters, digits, and '-' are allowed");
+        }
+        Ok(())
+    }
+
+    /// Shared resolver: canonical `SubnetId` from `ROOT`/`root`, `0x`+64-hex /
+    /// bare 64-hex, or a grammar-valid public id. Err only for inputs that are
+    /// structurally impossible as a subnet id — never a silent ROOT fallback.
+    ///
+    /// The success path must stay byte-identical to the legacy storage
+    /// `resolve_subnet_id` (`from_hex` else `from_str_id`) because stored coin
+    /// `coin_type` strings were canonicalized with that mapping (design D1,
+    /// equality test #21).
+    pub fn parse_public_or_hex(value: &str) -> Result<Self, SubnetIdParseError> {
+        if value.trim().is_empty() {
+            return Err(SubnetIdParseError::Empty);
+        }
+        if value == "ROOT" || value == "root" {
+            return Ok(Self::ROOT);
+        }
+        let bare = value.strip_prefix("0x").unwrap_or(value);
+        if bare.len() == 64 && bare.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Self::from_hex(value).map_err(SubnetIdParseError::InvalidHex);
+        }
+        Self::validate_public_id_grammar(value).map_err(SubnetIdParseError::InvalidGrammar)?;
+        Ok(Self::from_str_id(value))
+    }
+
+    /// Full 64-hex form with `0x` prefix. Unlike `Display` (short, presentation
+    /// only), this is safe for storage, signing, protocol, and routing.
+    pub fn to_full_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.0))
+    }
+
+    /// Canonical string form for signing and protocol: `"ROOT"` for the root
+    /// subnet, full `0x`+64-hex otherwise (design D3.2).
+    pub fn canonical_string(&self) -> String {
+        if self.is_root() {
+            "ROOT".to_string()
+        } else {
+            self.to_full_hex()
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -679,6 +778,71 @@ mod tests {
         assert_eq!(membership.subnet_count(), 1);
     }
     
+    // Test #1 (design §9): parse ROOT/root/full hex/public id
+    #[test]
+    fn test_parse_public_or_hex_accepts_all_forms() {
+        assert_eq!(SubnetId::parse_public_or_hex("ROOT").unwrap(), SubnetId::ROOT);
+        assert_eq!(SubnetId::parse_public_or_hex("root").unwrap(), SubnetId::ROOT);
+
+        let public = SubnetId::parse_public_or_hex("gaming-subnet").unwrap();
+        assert_eq!(public, SubnetId::from_str_id("gaming-subnet"));
+        assert!(public.is_app());
+
+        let full_hex = format!("0x{}", hex::encode(public.as_bytes()));
+        assert_eq!(SubnetId::parse_public_or_hex(&full_hex).unwrap(), public);
+        // Bare 64-hex (no 0x prefix) also resolves
+        let bare_hex = hex::encode(public.as_bytes());
+        assert_eq!(SubnetId::parse_public_or_hex(&bare_hex).unwrap(), public);
+    }
+
+    // Test #2 (design §9): invalid subnet rejects — no fallback to ROOT
+    #[test]
+    fn test_parse_public_or_hex_rejects_invalid_without_root_fallback() {
+        for bad in [
+            "",
+            "   ",
+            "ab",                        // too short
+            "Gaming-Subnet",             // uppercase
+            "gaming_subnet",             // underscore
+            "-gaming",                   // leading hyphen
+            "gaming-",                   // trailing hyphen
+            " gaming ",                  // whitespace
+            "governance",                // reserved
+            &"a".repeat(65),             // too long
+        ] {
+            let result = SubnetId::parse_public_or_hex(bad);
+            assert!(result.is_err(), "input {:?} must be rejected, got {:?}", bad, result);
+        }
+        // "root"/"ROOT" resolve to ROOT by rule, but the reserved word never
+        // resolves via the grammar/hash branch.
+        assert_eq!(SubnetId::parse_public_or_hex("root").unwrap(), SubnetId::ROOT);
+    }
+
+    // Test #3 (design §9): canonical string is full hex, never short Display
+    #[test]
+    fn test_canonical_string_full_hex_not_short_display() {
+        assert_eq!(SubnetId::ROOT.canonical_string(), "ROOT");
+
+        let id = SubnetId::from_str_id("gaming-subnet");
+        let canonical = id.canonical_string();
+        assert_eq!(canonical.len(), 2 + 64);
+        assert!(canonical.starts_with("0x"));
+        assert_ne!(canonical, id.to_string(), "short Display must differ from canonical");
+        // Round-trips through the resolver
+        assert_eq!(SubnetId::parse_public_or_hex(&canonical).unwrap(), id);
+        assert_eq!(id.to_full_hex(), canonical);
+    }
+
+    #[test]
+    fn test_validate_public_id_grammar_matches_registration_rules() {
+        assert!(SubnetId::validate_public_id_grammar("gaming-subnet").is_ok());
+        assert!(SubnetId::validate_public_id_grammar("abc").is_ok());
+        assert!(SubnetId::validate_public_id_grammar("a1-b2-c3").is_ok());
+        assert!(SubnetId::validate_public_id_grammar("root").is_err());
+        assert!(SubnetId::validate_public_id_grammar("ROOT").is_err());
+        assert!(SubnetId::validate_public_id_grammar("governance").is_err());
+    }
+
     #[test]
     fn test_cross_subnet_context() {
         let defi = SubnetId::from_str_id("defi");

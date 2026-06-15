@@ -30,7 +30,7 @@ pub use setu_vlc::{VectorClock, VLCSnapshot};
 
 // Export from transfer module
 pub use transfer::{
-    Transfer, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
+    Transfer, TransferAuthorization, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
 };
 
 // Export from registration module
@@ -91,7 +91,7 @@ pub use relation::{
 
 // Subnet related
 pub use subnet::{
-    SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
+    SubnetId, SubnetIdParseError, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
     // Subnet interaction tracking
     InteractionType, SubnetInteraction, LocalRelation, UserSubnetActivity,
 };

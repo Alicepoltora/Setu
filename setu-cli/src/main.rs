@@ -502,12 +502,17 @@ enum TransferAction {
         /// Shard ID (optional)
         #[arg(long)]
         shard: Option<String>,
-        
+
+        /// Target subnet: public id (e.g. gaming-subnet) or full 0x+64-hex.
+        /// Subnet token transfers accept raw --amount-units only.
+        #[arg(long = "subnet-id")]
+        subnet_id: Option<String>,
+
         /// Router address
         #[arg(long, default_value = "127.0.0.1:8080")]
         router: String,
     },
-    
+
     /// Query transfer status
     Status {
         /// Transfer ID

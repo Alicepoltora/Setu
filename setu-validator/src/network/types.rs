@@ -47,6 +47,9 @@ pub struct NetworkServiceConfig {
     pub http_listen_addr: SocketAddr,
     /// Listen address for Anemo P2P
     pub p2p_listen_addr: SocketAddr,
+    /// Chain id bound into V2 signed-transfer messages (design D2.7/D3).
+    /// Sourced from `GenesisConfig.chain_id` in production startup.
+    pub chain_id: String,
 }
 
 impl Default for NetworkServiceConfig {
@@ -54,6 +57,7 @@ impl Default for NetworkServiceConfig {
         Self {
             http_listen_addr: "127.0.0.1:8080".parse().unwrap(),
             p2p_listen_addr: "127.0.0.1:9000".parse().unwrap(),
+            chain_id: "setu-dev".to_string(),
         }
     }
 }
@@ -158,6 +162,10 @@ pub fn current_timestamp_millis() -> u64 {
 #[derive(Debug, Clone)]
 pub struct SubnetInfo {
     pub subnet_id: String,
+    /// Canonical id derived from `subnet_id` with the shared D1 resolver.
+    /// Admission existence checks (design D7) compare against this, never
+    /// against the raw user string, so full-hex addressing also matches.
+    pub canonical_id: setu_types::SubnetId,
     pub name: String,
     pub owner: String,
     pub subnet_type: String,
@@ -170,11 +178,18 @@ impl SubnetInfo {
     /// Build from a `SubnetRegistration` event payload.
     ///
     /// `timestamp_ms` is the event timestamp in milliseconds.
+    ///
+    /// Both the replay path (`apply_replay_event`) and the live-finalize path
+    /// (`apply_live_finalized_side_effects`) construct through here, so
+    /// `canonical_id` stays consistent between fresh boot and replay
+    /// (design D7 / R6-PASS-3).
     pub fn from_registration(
         reg: &setu_types::registration::SubnetRegistration,
         timestamp_ms: u64,
     ) -> Self {
         Self {
+            canonical_id: setu_types::SubnetId::parse_public_or_hex(&reg.subnet_id)
+                .unwrap_or_else(|_| setu_types::SubnetId::from_str_id(&reg.subnet_id)),
             subnet_id: reg.subnet_id.clone(),
             name: reg.name.clone(),
             owner: reg.owner.clone(),

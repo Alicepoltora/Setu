@@ -451,19 +451,15 @@ impl MerkleStateProvider {
 
     /// Get coin namespace as owned String from subnet_id
     ///
-    /// Simplification: subnet_id IS the coin namespace!
-    /// No derivation function needed.
-    ///
-    /// Rules:
-    /// - ROOT subnet → "ROOT"
-    /// - Other subnets → subnet_id.to_string() directly
+    /// Only the ROOT branch participates in coin identity today (the legacy
+    /// deterministic-coin-id fallback in `create_batch_snapshot` is
+    /// ROOT-only); actual coin matching is the canonical
+    /// `resolve_subnet_id(coin_type) == subnet_id` compare. Non-ROOT returns
+    /// the canonical full-hex form — never the short `Display`, which is
+    /// presentation-only (design D1.6).
     #[inline]
     pub fn coin_namespace_string(subnet_id: &SubnetId) -> String {
-        if *subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        }
+        subnet_id.canonical_string()
     }
 
     // NOTE: modification_tracker() accessor is defined in provider.rs

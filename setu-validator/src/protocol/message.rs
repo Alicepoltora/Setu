@@ -293,6 +293,7 @@ mod tests {
             shard_id: None,
             subnet_id: None,
             assigned_vlc: None,
+            authorization: None,
         };
 
         let event = Event::transfer(

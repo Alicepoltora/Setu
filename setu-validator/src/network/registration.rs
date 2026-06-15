@@ -23,37 +23,11 @@ use tracing::{debug, info, warn};
 pub struct ValidatorRegistrationHandler {
     pub(crate) service: Arc<ValidatorNetworkService>,
 }
+
 fn validate_public_subnet_id(raw: &str) -> Result<String, &'static str> {
-    let value = raw.trim();
-    if value.is_empty() {
-        return Err("Invalid subnet_id: must not be empty");
-    }
-    if value != raw {
-        return Err("Invalid subnet_id: leading/trailing whitespace is not allowed");
-    }
-    if value.len() < 3 || value.len() > 64 {
-        return Err("Invalid subnet_id: length must be 3-64 characters");
-    }
-    if value.eq_ignore_ascii_case("root") || value.eq_ignore_ascii_case("governance") {
-        return Err("Invalid subnet_id: reserved system id");
-    }
-
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err("Invalid subnet_id: must not be empty");
-    };
-    let last = value.chars().last().unwrap_or(first);
-    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
-        return Err("Invalid subnet_id: must start and end with a letter or digit");
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        return Err("Invalid subnet_id: only lowercase letters, digits, and '-' are allowed");
-    }
-
-    Ok(value.to_string())
+    // Grammar lives in types so the D1 resolver and registration cannot drift.
+    setu_types::SubnetId::validate_public_id_grammar(raw)?;
+    Ok(raw.to_string())
 }
 
 fn validate_public_subnet_name(raw: &str) -> Result<String, &'static str> {
@@ -462,6 +436,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
 
         self.service.add_subnet(SubnetInfo {
+            canonical_id: setu_types::SubnetId::parse_public_or_hex(&subnet_id)
+                .unwrap_or_else(|_| setu_types::SubnetId::from_str_id(&subnet_id)),
             subnet_id: subnet_id.clone(),
             name: subnet_name,
             owner: request.owner.clone(),
@@ -671,6 +647,7 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
     }
 }
+
 #[cfg(test)]
 mod solver_routable_tests {
     use super::*;
@@ -764,3 +741,4 @@ mod solver_routable_tests {
         );
     }
 }
+
