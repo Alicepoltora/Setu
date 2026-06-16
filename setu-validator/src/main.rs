@@ -576,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
                             if bytes.len() == 32 {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&bytes);
-                                gsm.record_modification(&genesis_event_id, arr);
+                                gsm.record_modification(&genesis_event_id, arr, 0);
                             }
                         }
                     }
@@ -725,6 +725,15 @@ async fn main() -> anyhow::Result<()> {
     let network_config = NetworkServiceConfig {
         http_listen_addr: config.http_addr,
         p2p_listen_addr: config.p2p_addr,
+        // V2 signed transfers bind this chain id (design D2.7). Genesis is the
+        // authoritative source; SETU_CHAIN_ID covers recovered-state startups
+        // where genesis parsing was skipped.
+        chain_id: genesis_result
+            .as_ref()
+            .map(|g| g.chain_id.clone())
+            .unwrap_or_else(|_| {
+                std::env::var("SETU_CHAIN_ID").unwrap_or_else(|_| "setu-dev".to_string())
+            }),
     };
     
     // Create network service with consensus enabled

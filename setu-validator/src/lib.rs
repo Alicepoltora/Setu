@@ -43,6 +43,7 @@ pub mod network_adapter;
 pub mod persistence;
 pub mod protocol;
 pub mod coin_reservation;
+pub mod user_transfer_nonce;
 pub mod dag_replay;
 pub mod governance;
 pub mod outcome_sink;

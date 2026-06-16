@@ -59,6 +59,23 @@ use setu_types::task::MerkleProof;
 /// Maximum merge sources mirroring runtime's MAX_MERGE_SOURCES.
 pub const MAX_MERGE_SOURCES: usize = 50;
 
+/// Cross-CF depth window enforced by `DagManager` (`max_cross_cf_depth`, default
+/// 200). A parent edge whose modifying event is older than this many depth
+/// levels is rejected as `ParentTooOld` at `resolve_parents` time.
+pub const MAX_CROSS_CF_DEPTH: u64 = 200;
+
+/// Safety margin below `MAX_CROSS_CF_DEPTH` for the prepare-time cold-parent
+/// drop. The decision is made at preparation against the (proxied) depth floor,
+/// which advances before the event finalizes; the margin guarantees an edge we
+/// *keep* cannot age past `MAX_CROSS_CF_DEPTH` before it lands. Empirically the
+/// floor advances ~0.32 depth/min, so a 50-level margin is >10× headroom.
+/// See docs/feat/fix-transfer-parent-too-old-general/design.md §5a.
+pub const COLD_PARENT_MARGIN: u64 = 50;
+
+/// Drop a non-genesis parent edge when `floor − parent_depth` reaches this
+/// threshold (= `MAX_CROSS_CF_DEPTH − COLD_PARENT_MARGIN` = 150).
+pub const COLD_PARENT_DROP_THRESHOLD: u64 = MAX_CROSS_CF_DEPTH - COLD_PARENT_MARGIN;
+
 /// Result of coin selection for a transfer.
 ///
 /// When no single coin suffices, `NeedMerge` instructs the caller to

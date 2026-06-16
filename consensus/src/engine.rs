@@ -130,6 +130,8 @@ pub struct ConsensusEngine {
     /// Channel for receiving consensus messages (reserved for future use)
     #[allow(dead_code)]
     message_rx: Arc<Mutex<mpsc::Receiver<ConsensusMessage>>>,
+    /// Logs the first dropped legacy local notification to avoid warning spam.
+    legacy_channel_drop_logged: AtomicBool,
     /// Network broadcaster for P2P message delivery (optional)
     broadcaster: Arc<RwLock<Option<Arc<dyn ConsensusBroadcaster>>>>,
     /// Anchors from inline-finalized CFs (single-node mode) pending persistence.
@@ -191,6 +193,7 @@ impl ConsensusEngine {
             strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
+            legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
@@ -237,6 +240,7 @@ impl ConsensusEngine {
             strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
+            legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
@@ -279,6 +283,7 @@ impl ConsensusEngine {
             strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
+            legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
@@ -320,6 +325,7 @@ impl ConsensusEngine {
             strict_vote_signatures: AtomicBool::new(false),
             message_tx: tx,
             message_rx: Arc::new(Mutex::new(rx)),
+            legacy_channel_drop_logged: AtomicBool::new(false),
             broadcaster: Arc::new(RwLock::new(None)),
             pending_persist_anchors: Arc::new(Mutex::new(Vec::new())),
             pending_persist_cfs: Arc::new(Mutex::new(Vec::new())),
@@ -341,6 +347,38 @@ impl ConsensusEngine {
         *self.private_key.write().await = None;
     }
 
+    fn send_legacy_message(&self, message: ConsensusMessage) {
+        match self.message_tx.try_send(message) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(message)) => {
+                self.log_legacy_message_drop("full", &message);
+            }
+            Err(mpsc::error::TrySendError::Closed(message)) => {
+                self.log_legacy_message_drop("closed", &message);
+            }
+        }
+    }
+
+    fn log_legacy_message_drop(&self, reason: &'static str, message: &ConsensusMessage) {
+        if !self.legacy_channel_drop_logged.swap(true, Ordering::Relaxed) {
+            warn!(
+                reason,
+                message_kind = Self::legacy_message_kind(message),
+                "Dropping legacy consensus notification; channel is best-effort and non-blocking"
+            );
+        }
+    }
+
+    fn legacy_message_kind(message: &ConsensusMessage) -> &'static str {
+        match message {
+            ConsensusMessage::NewEvent(_) => "NewEvent",
+            ConsensusMessage::ProposeFrame(_) => "ProposeFrame",
+            ConsensusMessage::Vote(_) => "Vote",
+            ConsensusMessage::FrameFinalized(_) => "FrameFinalized",
+            ConsensusMessage::LeaderChanged { .. } => "LeaderChanged",
+        }
+    }
+
     /// Enable production vote signature enforcement.
     ///
     /// Constructors stay permissive for legacy tests and local fixtures;
@@ -351,6 +389,11 @@ impl ConsensusEngine {
 
     fn require_vote_signatures(&self) -> bool {
         self.strict_vote_signatures.load(Ordering::SeqCst)
+    }
+
+    /// Read-only accessor for strict vote signature enforcement (health telemetry).
+    pub fn strict_vote_signatures_enabled(&self) -> bool {
+        self.require_vote_signatures()
     }
 
     /// Take all pending anchors that were finalized inline (single-node mode).
@@ -416,10 +459,7 @@ impl ConsensusEngine {
             let cf_id = cf.id.clone();
 
             // Internal channel (legacy local listeners).
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::FrameFinalized(cf.clone()))
-                .await;
+            self.send_legacy_message(ConsensusMessage::FrameFinalized(cf.clone()));
 
             // External broadcast subscribers (governance Task A, etc.).
             // Now fires post-persist so subscribers only see durable CFs.
@@ -633,11 +673,8 @@ impl ConsensusEngine {
                 }
             }
 
-            // Still send to internal channel for backward compatibility or local monitoring
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::NewEvent(event))
-                .await;
+            // Still send to internal channel for backward compatibility or local monitoring.
+            self.send_legacy_message(ConsensusMessage::NewEvent(event));
         }
 
         // Try to create a ConsensusFrame if we're the leader
@@ -745,13 +782,10 @@ impl ConsensusEngine {
 
         // Notify about leader change
         if let Some(new_leader) = validator_set.get_leader_id() {
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::LeaderChanged {
-                    round: new_round,
-                    new_leader: new_leader.clone(),
-                })
-                .await;
+            self.send_legacy_message(ConsensusMessage::LeaderChanged {
+                round: new_round,
+                new_leader: new_leader.clone(),
+            });
         }
 
         new_round
@@ -866,11 +900,8 @@ impl ConsensusEngine {
                 }
             }
 
-            // Send to internal channel (legacy, not consumed in production)
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::ProposeFrame(frame.clone()))
-                .await;
+            // Send to internal channel (legacy, not consumed in production).
+            self.send_legacy_message(ConsensusMessage::ProposeFrame(frame.clone()));
 
             // Prepare CF for broadcast: embed leader's self-vote for atomic delivery.
             // This guarantees followers receive CF + leader vote in a single message,
@@ -1692,11 +1723,8 @@ impl ConsensusEngine {
                 }
             }
 
-            // Send to internal channel (legacy)
-            let _ = self
-                .message_tx
-                .send(ConsensusMessage::ProposeFrame(frame.clone()))
-                .await;
+            // Send to internal channel (legacy).
+            self.send_legacy_message(ConsensusMessage::ProposeFrame(frame.clone()));
 
             // Broadcast to network (multi-node: followers need to receive and vote)
             let mut broadcast_frame = frame.clone();
@@ -2901,6 +2929,47 @@ mod tests {
             manager.pending_cfs_len(),
             0,
             "run_periodic_maintenance must remove timed-out CFs"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_message_channel_full_does_not_block_heartbeat_cf() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 1_000,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            cf_timeout_ms: 5_000,
+            validator_count: 3,
+        };
+        let engine = ConsensusEngine::new(config, "v1".to_string(), create_validator_set());
+        assert!(engine.is_current_leader().await);
+
+        let event = engine.create_event(vec![]).await.unwrap();
+        engine.add_event(event).await.unwrap();
+
+        let mut filled = 0usize;
+        loop {
+            let vote = Vote::new("v1".to_string(), "cf".to_string(), true);
+            match engine.message_tx.try_send(ConsensusMessage::Vote(vote)) {
+                Ok(()) => filled += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("legacy message channel closed during test setup")
+                }
+            }
+        }
+        assert!(filled > 0, "test setup must fill the legacy channel");
+
+        let heartbeat = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.try_create_cf_heartbeat(std::time::Duration::from_millis(0)),
+        )
+        .await;
+
+        let result = heartbeat.expect("heartbeat CF creation must not block on legacy channel");
+        assert!(
+            result.unwrap().is_some(),
+            "pending event should produce a heartbeat CF"
         );
     }
 }

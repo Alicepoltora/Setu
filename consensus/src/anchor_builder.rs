@@ -747,6 +747,7 @@ impl AnchorBuilder {
         // Apply state changes to SMT and commit in a single write lock
         let events = pending.all_events();
         let anchor_id = self.anchor_depth + 1;
+        let finalized_depth = pending.new_anchor_depth;
         let cf_id = pending.anchor.id.clone();
 
         // DIAG (H2): look up the prepare-time base root recorded by
@@ -784,7 +785,7 @@ impl AnchorBuilder {
             #[cfg(feature = "diag-root-drift")]
             Self::diag_h4_probes(&cf_id, "leader", &guard, &events);
 
-            let summary = guard.apply_committed_events(&events);
+            let summary = guard.apply_committed_events(&events, finalized_depth);
             match guard.commit(anchor_id) {
                 Ok(()) => {
                     // DIAG H1: after the real apply+commit, the write GSM's
@@ -902,6 +903,7 @@ impl AnchorBuilder {
         // Without this, concurrent CF proposals can clone the same base state,
         // and the second one's verification becomes stale after the first commits.
         let anchor_id = self.anchor_depth + 1;
+        let finalized_depth = cf.anchor.depth + 1;
         // Inner result lets us drop the write guard before any overlay-clear side
         // effect runs on the error path.
         let inner: Result<StateApplySummary, AnchorBuildError> = {
@@ -917,7 +919,7 @@ impl AnchorBuilder {
             if let Some(ref merkle_roots) = cf.anchor.merkle_roots {
                 // Clone from write GSM under the lock
                 let mut temp_manager = (*guard).clone();
-                let verify_summary = temp_manager.apply_committed_events(events);
+                let verify_summary = temp_manager.apply_committed_events(events, finalized_depth);
                 let (expected_root, _) = temp_manager.compute_global_root_bytes();
 
                 if expected_root != merkle_roots.global_state_root {
@@ -943,7 +945,7 @@ impl AnchorBuilder {
                     })
                 } else {
                     // 3. Apply state changes and commit (same lock scope)
-                    let summary = guard.apply_committed_events(events);
+                    let summary = guard.apply_committed_events(events, finalized_depth);
 
                     // DIAG H5 (R2-ISSUE-8): the verify-clone root matched the
                     // declared root, but the second apply runs on the real
@@ -990,7 +992,7 @@ impl AnchorBuilder {
                 }
             } else {
                 // No merkle_roots to verify — apply directly
-                let summary = guard.apply_committed_events(events);
+                let summary = guard.apply_committed_events(events, finalized_depth);
                 match guard.commit(anchor_id) {
                     Ok(()) => {
                         // DIAG P5 (cf_apply_progress): see leader-side note.
@@ -1103,7 +1105,9 @@ impl AnchorBuilder {
         });
         let mut sandbox = guard.clone();
         for (idx, ev) in sorted.iter().enumerate() {
-            let _ = sandbox.apply_committed_events(std::slice::from_ref(*ev));
+            // Diagnostic sandbox clone (discarded) — recorded depth is never
+            // read; pass 0.
+            let _ = sandbox.apply_committed_events(std::slice::from_ref(*ev), 0);
             let (r, _) = sandbox.compute_global_root_bytes();
             tracing::debug!(
                 target: "consensus::diag::event_apply_delta",
@@ -1305,7 +1309,9 @@ impl AnchorBuilder {
 
         // Apply using identical logic to Follower:
         // VLC-sorted, conflict-detected, genesis-aware
-        temp_manager.apply_committed_events(events);
+        // Discarded temp clone (root computation only) — recorded depth is never
+        // read; pass 0.
+        temp_manager.apply_committed_events(events, 0);
 
         // Compute and return the root
         temp_manager.compute_global_root_bytes()
@@ -1583,6 +1589,133 @@ mod tests {
         assert_eq!(builder.anchor_depth(), expected_depth);
         assert_eq!(builder.last_fold_vlc(), expected_vlc);
         assert_eq!(builder.anchor_count(), 1);
+    }
+
+    #[test]
+    fn test_commit_build_records_post_finalize_depth_for_cold_parent_drop() {
+        let config = ConsensusConfig {
+            vlc_delta_threshold: 5,
+            min_events_per_cf: 1,
+            max_events_per_cf: 100,
+            ..Default::default()
+        };
+
+        let mut builder = AnchorBuilder::new(config);
+        let vlc = create_vlc("node1", 10);
+        let key = test_oid_key("cold-parent-depth:alice");
+        let object_hash = setu_storage::GlobalStateManager::parse_state_change_key(&key);
+
+        let event = create_event_with_result(
+            SubnetId::ROOT,
+            vec![StateChange {
+                key,
+                old_value: None,
+                new_value: Some(vec![100; 8]),
+                target_subnet: None,
+            }],
+        );
+        let event_id = event.id.clone();
+
+        // Force a CF whose new finalized depth is much larger than the old
+        // builder watermark + 1. The cold-parent tracker must record the
+        // post-finalize floor (`pending.new_anchor_depth`), not the storage
+        // commit version (`self.anchor_depth + 1`).
+        let pending = builder.force_prepare_build(vec![event], &vlc, 10).unwrap();
+        let expected_finalized_depth = pending.new_anchor_depth;
+        assert_eq!(expected_finalized_depth, 11);
+
+        builder.commit_build(pending).expect("commit build");
+
+        let snapshot = builder.shared.load_snapshot();
+        assert_eq!(snapshot.last_finalized_depth(), expected_finalized_depth);
+        let (recorded_event_id, recorded_depth) = snapshot
+            .get_last_modifying_event_depth(object_hash.as_bytes())
+            .expect("object should have a modifying event");
+        assert_eq!(recorded_event_id, &event_id);
+        assert_eq!(recorded_depth, expected_finalized_depth);
+    }
+
+    /// G-SPAN EXPOSURE QUANTIFICATION
+    /// (docs/bugs/20260605-cold-parent-depth-span-gap.md)
+    ///
+    /// The cold-parent drop compares `floor − recorded_depth` where
+    /// `recorded_depth = anchor.depth + 1` (the CF finalize floor), but
+    /// `resolve_parents` compares `new_event_depth − parent_DAG_depth`. When one
+    /// CF folds events spanning many DAG depths, `recorded_depth` OVER-estimates
+    /// the lowest-depth event's true DAG depth by the fold span `g`, so the drop
+    /// logic under-counts that edge's age by `g + 1`.
+    ///
+    /// This test proves the gap is NOT bounded by the γ strict-same-key fold
+    /// policy: γ only defers events with intersecting write-keys, never bounds
+    /// the DAG depth span. 55 DISJOINT-key events at depths 1..=55 are all kept
+    /// in one CF, and the depth-1 object then records `finalized_depth = 56`
+    /// (a `g = 55` over-estimate of its true DAG depth 1), a gap exceeding
+    /// `COLD_PARENT_MARGIN` (50). In production CF cadence keeps `g ≪ 50`; this
+    /// test asserts the gap MAGNITUDE, not a live failure.
+    #[test]
+    fn cold_parent_depth_span_gap_is_not_bounded_by_gamma() {
+        const SPAN: u64 = 55;
+        let mut builder = AnchorBuilder::new(gamma_config(200));
+
+        // Insert SPAN events with DISTINCT keys at DAG depths 1..=SPAN.
+        // Distinct keys ⇒ γ keeps every one (no same-key deferral).
+        let mut dag = ConsensusDag::new();
+        for d in 1..=SPAN {
+            let ev = gamma_make_event(
+                &format!("span-evt-{d}"),
+                SubnetId::ROOT,
+                d, // ascending logical_time so the VLC sort is total
+                &[&format!("span-coin-{d}")],
+            );
+            dag.add_event_with_depth(ev, d)
+                .expect("add_event_with_depth");
+        }
+
+        let vlc = create_vlc("node1", SPAN + 1);
+        let in_flight: HashSet<EventId> = HashSet::new();
+
+        let pending = builder
+            .prepare_build(&dag, &vlc, &in_flight)
+            .expect("prepare_build should fold the full span");
+
+        // (1) γ kept ALL SPAN events — it does NOT bound the CF depth span.
+        assert_eq!(
+            pending.anchor.event_ids.len(),
+            SPAN as usize,
+            "γ must keep all disjoint-key events: γ does NOT bound CF depth span"
+        );
+        // anchor.depth == to_depth == max DAG depth == SPAN.
+        assert_eq!(pending.anchor.depth, SPAN);
+        assert_eq!(pending.new_anchor_depth, SPAN + 1);
+
+        builder.commit_build(pending).expect("commit");
+
+        // (2) The depth-1 event's object recorded finalized_depth = SPAN + 1,
+        // a g = SPAN - 1 over-estimate of its true DAG depth (1).
+        let key = test_oid_key("span-coin-1");
+        let object_hash = setu_storage::GlobalStateManager::parse_state_change_key(&key);
+        let snapshot = builder.shared.load_snapshot();
+        let (_recorded_event_id, recorded_depth) = snapshot
+            .get_last_modifying_event_depth(object_hash.as_bytes())
+            .expect("depth-1 object should have a modifying event");
+        assert_eq!(
+            recorded_depth,
+            SPAN + 1,
+            "recorded depth is the CF floor (anchor.depth+1), not the event's DAG depth"
+        );
+
+        // The true DAG depth of that event was 1; the drop logic under-counts
+        // its age by g = SPAN - 1. With SPAN = 55 the gap (55) exceeds
+        // COLD_PARENT_MARGIN (50): a depth-1 parent edge whose real cross-CF
+        // diff is `floor − 1` is judged by the drop logic as `floor − 56`.
+        // This asserts the gap magnitude (latent exposure), not a live failure —
+        // cadence keeps the span ≪ 50 in production (see bug doc Impact).
+        let true_dag_depth = 1u64;
+        let gap = recorded_depth - true_dag_depth;
+        assert!(
+            gap >= 50,
+            "fold-span gap (g+1 = {gap}) can exceed COLD_PARENT_MARGIN (50)"
+        );
     }
 
     #[test]

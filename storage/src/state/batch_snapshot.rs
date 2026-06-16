@@ -74,9 +74,13 @@ pub struct BatchStateSnapshot {
     /// Pre-fetched Merkle proofs by object ID
     proofs: HashMap<ObjectId, SimpleMerkleProof>,
 
-    /// Pre-fetched last modifying event IDs by object ID
-    /// Used to derive parent_ids for DAG causal dependencies
-    last_modifying_events: HashMap<ObjectId, String>,
+    /// Pre-fetched last modifying (event ID, finalized depth) by object ID
+    /// Used to derive parent_ids for DAG causal dependencies and to drop cold
+    /// parent edges that have aged past the cross-CF window.
+    last_modifying_events: HashMap<ObjectId, (String, u64)>,
+
+    /// Anchor depth of the last applied CF at snapshot time (sync floor proxy).
+    finalized_depth: u64,
 }
 
 impl BatchStateSnapshot {
@@ -112,7 +116,20 @@ impl BatchStateSnapshot {
 
     /// Get last modifying event ID for an object (for DAG causal dependencies)
     pub fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<&String> {
-        self.last_modifying_events.get(object_id)
+        self.last_modifying_events.get(object_id).map(|(id, _)| id)
+    }
+
+    /// Get last modifying (event ID, finalized depth) for an object.
+    pub fn get_last_modifying_event_depth(&self, object_id: &ObjectId) -> Option<(&String, u64)> {
+        self.last_modifying_events
+            .get(object_id)
+            .map(|(id, depth)| (id, *depth))
+    }
+
+    /// Anchor depth of the last applied CF at snapshot time (sync floor proxy).
+    #[inline]
+    pub fn finalized_depth(&self) -> u64 {
+        self.finalized_depth
     }
 
     /// Get object data with its proof from cache
@@ -149,6 +166,30 @@ impl BatchStateSnapshot {
     pub fn is_valid(&self, current_anchor: u64) -> bool {
         self.snapshot_version == current_anchor
     }
+
+    /// Construct a minimal snapshot for unit tests of cold-parent dropping.
+    ///
+    /// Only `finalized_depth` and the `(object_id → (event_id, depth))` map are
+    /// populated; all other fields are empty/zero.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_testing(
+        finalized_depth: u64,
+        last_modifying_events: Vec<(ObjectId, String, u64)>,
+    ) -> Self {
+        let mut map = HashMap::new();
+        for (oid, event_id, depth) in last_modifying_events {
+            map.insert(oid, (event_id, depth));
+        }
+        Self {
+            state_root: [0u8; 32],
+            snapshot_version: 0,
+            coins: HashMap::new(),
+            objects: HashMap::new(),
+            proofs: HashMap::new(),
+            last_modifying_events: map,
+            finalized_depth,
+        }
+    }
 }
 
 /// Builder for BatchStateSnapshot
@@ -161,12 +202,13 @@ pub struct BatchStateSnapshotBuilder {
     coins: HashMap<(String, SubnetId), Vec<CoinInfo>>,
     objects: HashMap<ObjectId, Vec<u8>>,
     proofs: HashMap<ObjectId, SimpleMerkleProof>,
-    last_modifying_events: HashMap<ObjectId, String>,
+    last_modifying_events: HashMap<ObjectId, (String, u64)>,
+    finalized_depth: u64,
 }
 
 impl BatchStateSnapshotBuilder {
     /// Create a new builder with initial state from state_manager
-    fn new(state_root: [u8; 32], snapshot_version: u64) -> Self {
+    fn new(state_root: [u8; 32], snapshot_version: u64, finalized_depth: u64) -> Self {
         Self {
             state_root,
             snapshot_version,
@@ -174,6 +216,7 @@ impl BatchStateSnapshotBuilder {
             objects: HashMap::new(),
             proofs: HashMap::new(),
             last_modifying_events: HashMap::new(),
+            finalized_depth,
         }
     }
 
@@ -187,9 +230,9 @@ impl BatchStateSnapshotBuilder {
         self.proofs.insert(object_id, proof);
     }
 
-    /// Add last modifying event
-    fn add_last_modifying_event(&mut self, object_id: ObjectId, event_id: String) {
-        self.last_modifying_events.insert(object_id, event_id);
+    /// Add last modifying (event, finalized depth)
+    fn add_last_modifying_event(&mut self, object_id: ObjectId, event_id: String, depth: u64) {
+        self.last_modifying_events.insert(object_id, (event_id, depth));
     }
 
     /// Check if a last modifying event is already recorded for an object
@@ -206,6 +249,7 @@ impl BatchStateSnapshotBuilder {
             objects: self.objects,
             proofs: self.proofs,
             last_modifying_events: self.last_modifying_events,
+            finalized_depth: self.finalized_depth,
         }
     }
 }
@@ -268,8 +312,9 @@ impl MerkleStateProvider {
             // 1. Compute state_root ONCE (avoid N recomputations)
             let (state_root, _subnet_roots) = snapshot.compute_global_root_bytes();
             let snapshot_version = snapshot.current_anchor();
+            let finalized_depth = snapshot.last_finalized_depth();
 
-            let mut builder = BatchStateSnapshotBuilder::new(state_root, snapshot_version);
+            let mut builder = BatchStateSnapshotBuilder::new(state_root, snapshot_version, finalized_depth);
 
             let mut coin_queries: Vec<CoinQuery> = Vec::new();
             for (sender, canonical_sender, subnet_id, coin_namespace) in &sender_queries {
@@ -361,8 +406,10 @@ impl MerkleStateProvider {
             // (Previously a separate Lock #2, now uses the same snapshot)
             // ══════════════════════════════════════════════════════════════
             for object_id in &all_object_ids {
-                if let Some(event_id) = snapshot.get_last_modifying_event(object_id.as_bytes()) {
-                    builder.add_last_modifying_event((*object_id).clone(), event_id.clone());
+                if let Some((event_id, depth)) =
+                    snapshot.get_last_modifying_event_depth(object_id.as_bytes())
+                {
+                    builder.add_last_modifying_event((*object_id).clone(), event_id.clone(), depth);
                 }
             }
 
@@ -378,7 +425,9 @@ impl MerkleStateProvider {
                 // Only add if not already found in GSM snapshot
                 if !builder.has_last_modifying_event(object_id) {
                     if let Some(event_id) = tracker.get(object_id.as_bytes()) {
-                        builder.add_last_modifying_event(object_id.clone(), event_id.clone());
+                        // Local fallback tracker is test-only and carries no
+                        // depth; record depth 0.
+                        builder.add_last_modifying_event(object_id.clone(), event_id.clone(), 0);
                     }
                 }
             }
@@ -402,19 +451,15 @@ impl MerkleStateProvider {
 
     /// Get coin namespace as owned String from subnet_id
     ///
-    /// Simplification: subnet_id IS the coin namespace!
-    /// No derivation function needed.
-    ///
-    /// Rules:
-    /// - ROOT subnet → "ROOT"
-    /// - Other subnets → subnet_id.to_string() directly
+    /// Only the ROOT branch participates in coin identity today (the legacy
+    /// deterministic-coin-id fallback in `create_batch_snapshot` is
+    /// ROOT-only); actual coin matching is the canonical
+    /// `resolve_subnet_id(coin_type) == subnet_id` compare. Non-ROOT returns
+    /// the canonical full-hex form — never the short `Display`, which is
+    /// presentation-only (design D1.6).
     #[inline]
     pub fn coin_namespace_string(subnet_id: &SubnetId) -> String {
-        if *subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        }
+        subnet_id.canonical_string()
     }
 
     // NOTE: modification_tracker() accessor is defined in provider.rs

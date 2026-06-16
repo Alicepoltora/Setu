@@ -92,7 +92,7 @@ echo -e "\n${CYAN}[5/6] Submitting Transfer...${NC}"
 TRANSFER_OUTPUT=$(cargo run --release -p setu-cli -- transfer submit \
     --from alice \
     --to bob \
-    --amount 1000 \
+    --amount-units 1000 \
     --transfer-type setu \
     --router $VALIDATOR_ADDR 2>&1)
 

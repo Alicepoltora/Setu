@@ -130,6 +130,26 @@ pub trait StateProvider: Send + Sync {
     /// Used for deriving event dependencies from input objects.
     /// Returns None for genesis objects or if tracking is not available.
     fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String>;
+
+    /// Get the event ID that last modified an object together with the anchor
+    /// depth of the CF that finalized it.
+    ///
+    /// Used by TaskPreparer to drop cold parent edges that have aged past the
+    /// cross-CF depth window. The default implementation maps the plain
+    /// `get_last_modifying_event` to depth 0 (correct for test/mocks and the
+    /// genesis object); production `MerkleStateProvider` overrides it to read
+    /// the real recorded depth.
+    fn get_last_modifying_event_depth(&self, object_id: &ObjectId) -> Option<(String, u64)> {
+        self.get_last_modifying_event(object_id).map(|id| (id, 0))
+    }
+
+    /// Current finalized depth = anchor depth of the last applied CF.
+    ///
+    /// Sync, consensus-agreed proxy for the DAG depth floor used by the
+    /// cold-parent drop decision. Default 0 (no folding has happened).
+    fn current_finalized_depth(&self) -> u64 {
+        0
+    }
     
     /// Get object with its proof (convenience method)
     fn get_object_with_proof(&self, object_id: &ObjectId) -> Option<(Vec<u8>, SimpleMerkleProof)> {
@@ -144,6 +164,32 @@ pub trait StateProvider: Send + Sync {
     /// Override this in implementations that support multi-subnet state.
     fn get_object_from_subnet(&self, object_id: &ObjectId, _subnet_id: &SubnetId) -> Option<Vec<u8>> {
         self.get_object(object_id)
+    }
+
+    /// Get a Merkle proof from a specific subnet SMT (design D8.4).
+    ///
+    /// Object bytes and proof must come from the same subnet SMT. Default
+    /// delegates to `get_merkle_proof()` for mock providers; the production
+    /// `MerkleStateProvider` overrides it with a real per-subnet proof.
+    fn get_merkle_proof_from_subnet(
+        &self,
+        object_id: &ObjectId,
+        _subnet_id: &SubnetId,
+    ) -> Option<SimpleMerkleProof> {
+        self.get_merkle_proof(object_id)
+    }
+
+    /// Get coins owned by an address whose `coin_type` resolves to the given
+    /// subnet (design D8.2 / R4-ISSUE-5).
+    ///
+    /// Coin namespace identity is the canonical `SubnetId`, never a string
+    /// compare: stored `coin_type` values may be public ids or hex forms, so
+    /// each is resolved with the same canonical mapping as the write path.
+    fn get_coins_for_address_in_subnet(&self, address: &str, subnet_id: &SubnetId) -> Vec<CoinInfo> {
+        self.get_coins_for_address(address)
+            .into_iter()
+            .filter(|c| MerkleStateProvider::resolve_subnet_id(&c.coin_type) == *subnet_id)
+            .collect()
     }
 
     /// Get raw storage data by string key.
@@ -383,13 +429,12 @@ impl MerkleStateProvider {
     /// this canonical mapping landed coins in ROOT SMT while reads looked
     /// in the app SMT.
     pub fn resolve_subnet_id(subnet_id_str: &str) -> SubnetId {
-        if subnet_id_str == "ROOT" {
-            SubnetId::ROOT
-        } else {
-            SubnetId::from_hex(subnet_id_str).unwrap_or_else(|_| {
-                SubnetId::from_str_id(subnet_id_str)
-            })
-        }
+        // Thin wrapper over the shared D1 resolver. Must stay total: stored
+        // coin_type values are always resolvable, and legacy callers rely on
+        // never failing. The from_str_id fallback keeps byte-identical
+        // behavior for any non-grammar string (equality test #21).
+        SubnetId::parse_public_or_hex(subnet_id_str)
+            .unwrap_or_else(|_| SubnetId::from_str_id(subnet_id_str))
     }
 }
 
@@ -494,10 +539,40 @@ impl StateProvider for MerkleStateProvider {
         tracker.get(object_id.as_bytes()).cloned()
     }
 
+    fn get_last_modifying_event_depth(&self, object_id: &ObjectId) -> Option<(String, u64)> {
+        // GSM tracker is the production-authoritative source (carries depth).
+        {
+            let snapshot = self.shared.load_snapshot();
+            if let Some((event_id, depth)) =
+                snapshot.get_last_modifying_event_depth(object_id.as_bytes())
+            {
+                return Some((event_id.clone(), depth));
+            }
+        }
+        // Local fallback tracker is test-only in production and stores no depth;
+        // map any hit to depth 0.
+        let tracker = self.modification_tracker.read().unwrap();
+        tracker.get(object_id.as_bytes()).map(|id| (id.clone(), 0))
+    }
+
+    fn current_finalized_depth(&self) -> u64 {
+        self.shared.load_snapshot().last_finalized_depth()
+    }
+
     fn get_object_from_subnet(&self, object_id: &ObjectId, subnet_id: &SubnetId) -> Option<Vec<u8>> {
         self.shared
             .load_overlay_view()
             .get_subnet_object(subnet_id, object_id.as_bytes())
+    }
+
+    fn get_merkle_proof_from_subnet(
+        &self,
+        object_id: &ObjectId,
+        subnet_id: &SubnetId,
+    ) -> Option<SimpleMerkleProof> {
+        let key = HashValue::from_slice(object_id.as_bytes()).ok()?;
+        let proof = self.get_proof_from_subnet(object_id.as_bytes(), subnet_id)?;
+        Some(Self::convert_proof(&key, &proof))
     }
 
     fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
@@ -721,6 +796,29 @@ mod tests {
         let mut gsm = GlobalStateManager::new();
         f(&mut gsm);
         Arc::new(SharedStateManager::new(gsm))
+    }
+
+    // Test #21 (design §9): the shared resolver's success path equals the
+    // legacy storage resolve_subnet_id for every input class that can exist
+    // as a live coin_type (ROOT / full hex / public id).
+    #[test]
+    fn test_shared_resolver_matches_storage_resolve_subnet_id() {
+        let public = SubnetId::from_str_id("gaming-subnet");
+        let inputs = [
+            "ROOT".to_string(),
+            "gaming-subnet".to_string(),
+            "a1-b2-c3".to_string(),
+            format!("0x{}", hex::encode(public.as_bytes())),
+            hex::encode(public.as_bytes()),
+        ];
+        for input in &inputs {
+            assert_eq!(
+                SubnetId::parse_public_or_hex(input).unwrap(),
+                MerkleStateProvider::resolve_subnet_id(input),
+                "resolver divergence for {:?}",
+                input
+            );
+        }
     }
 
     #[test]

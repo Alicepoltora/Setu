@@ -52,6 +52,48 @@ pub struct AssignedVlc {
     pub validator_id: String,
 }
 
+/// Authorization metadata distinguishing user-signed transfers from
+/// raw/admin transfers (design D5).
+///
+/// Mandatory fields are the minimal set needed to (a) tell an authorized
+/// transfer apart from a raw one and (b) recompute the D4 nonce marker.
+/// The optional fields are audit-only proof material: nothing re-verifies
+/// them at apply time today, so they must stay size-bounded when populated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferAuthorization {
+    /// Signing domain version (2 for SETU_TRANSFER_V2)
+    pub version: u8,
+    /// Normalized `from` address that signed the request
+    pub signer: String,
+    /// Per-sender idempotency key (D4); unique, not sequential
+    pub client_nonce: String,
+    /// blake3("SETU_TRANSFER_DIGEST_V2:" || canonical_v2_message_bytes)
+    pub request_digest: [u8; 32],
+    // --- Optional, audit-only (R4-ISSUE-6). Bounded by the admission layer. ---
+    pub scheme: Option<String>,
+    pub canonical_message: Option<String>,
+    pub signature: Option<Vec<u8>>,
+    pub public_key: Option<String>,
+    pub nostr_pubkey: Option<Vec<u8>>,
+}
+
+impl TransferAuthorization {
+    /// Minimal mandatory payload (no audit material)
+    pub fn new(signer: impl Into<String>, client_nonce: impl Into<String>, request_digest: [u8; 32]) -> Self {
+        Self {
+            version: 2,
+            signer: signer.into(),
+            client_nonce: client_nonce.into(),
+            request_digest,
+            scheme: None,
+            canonical_message: None,
+            signature: None,
+            public_key: None,
+            nostr_pubkey: None,
+        }
+    }
+}
+
 /// Complete transfer representation for routing and processing.
 ///
 /// A Transfer is the user-facing transaction request that gets
@@ -97,6 +139,10 @@ pub struct Transfer {
     /// VLC assigned by Validator when receiving the transfer.
     /// Solver should use this VLC when creating Event, NOT generate its own.
     pub assigned_vlc: Option<AssignedVlc>,
+
+    /// User authorization metadata (design D5). `Some` only for transfers
+    /// admitted through the signed user path; raw/admin transfers carry `None`.
+    pub authorization: Option<TransferAuthorization>,
 }
 
 impl Transfer {
@@ -117,9 +163,10 @@ impl Transfer {
             shard_id: None,
             subnet_id: None,
             assigned_vlc: None,
+            authorization: None,
         }
     }
-    
+
     /// Set transfer type
     pub fn with_type(mut self, transfer_type: TransferType) -> Self {
         self.transfer_type = transfer_type;
@@ -174,13 +221,32 @@ impl Transfer {
     }
     
     /// Get the SubnetId for routing, defaulting to ROOT if not specified or invalid
+    ///
+    /// DEPRECATED for routing decisions (design D1): silently collapses
+    /// invalid/non-hex ids to ROOT. Use `resolve_subnet_id()` instead.
     pub fn get_subnet_id(&self) -> crate::SubnetId {
         self.subnet_id
             .as_ref()
             .and_then(|s| crate::SubnetId::from_hex(s).ok())
             .unwrap_or(crate::SubnetId::ROOT)
     }
-    
+
+    /// Fallible canonical resolver (design D1): `None` means ROOT; any present
+    /// string must resolve via the shared resolver. Callers must not
+    /// `unwrap_or(ROOT)` the error — invalid input never falls back to ROOT.
+    pub fn resolve_subnet_id(&self) -> Result<crate::SubnetId, crate::subnet::SubnetIdParseError> {
+        match &self.subnet_id {
+            None => Ok(crate::SubnetId::ROOT),
+            Some(s) => crate::SubnetId::parse_public_or_hex(s),
+        }
+    }
+
+    /// Set authorization metadata (signed user path only)
+    pub fn with_authorization(mut self, authorization: TransferAuthorization) -> Self {
+        self.authorization = Some(authorization);
+        self
+    }
+
     /// Set assigned VLC from validator
     pub fn with_assigned_vlc(mut self, vlc: AssignedVlc) -> Self {
         self.assigned_vlc = Some(vlc);
@@ -210,6 +276,7 @@ impl Default for Transfer {
             shard_id: None,
             subnet_id: None,
             assigned_vlc: None,
+            authorization: None,
         }
     }
 }

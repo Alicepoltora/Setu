@@ -13,7 +13,6 @@ Thumbs.db
 
 # Rust
 **/*.rs.bk
-Cargo.lock
 
 # Logs
 *.log

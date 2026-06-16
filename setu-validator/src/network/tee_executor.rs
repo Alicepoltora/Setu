@@ -105,6 +105,62 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// Map solver DTO state changes into event state changes with explicit
+/// routing (design D9): every solver-produced change targets the task's
+/// subnet — never `None`, whose apply-time fallback is
+/// `event.get_subnet_id()` and silently defaults to ROOT. The solver DTO's
+/// own subnet string is deliberately not trusted for routing (D9.4).
+///
+/// If the event's transfer carries a user authorization (D5), a ROOT
+/// nonce-marker create (D4) is appended so replay protection finalizes
+/// atomically with the coin spend: the apply layer's whole-event conflict
+/// pre-check skips the coin writes of any duplicate whose marker-create
+/// conflicts (R15).
+fn build_execution_state_changes(
+    dto_changes: &[setu_transport::http::StateChangeDto],
+    task_subnet: setu_types::SubnetId,
+    event: &Event,
+) -> Vec<setu_types::event::StateChange> {
+    let mut changes: Vec<setu_types::event::StateChange> = dto_changes
+        .iter()
+        .map(|sc| setu_types::event::StateChange {
+            key: sc.key.clone(),
+            old_value: sc.old_value.clone(),
+            new_value: sc.new_value.clone(),
+            target_subnet: Some(task_subnet),
+        })
+        .collect();
+
+    if let setu_types::event::EventPayload::Transfer(transfer) = &event.payload {
+        if let Some(auth) = &transfer.authorization {
+            let marker_id = crate::user_transfer_nonce::nonce_object_id(
+                &auth.signer,
+                &auth.client_nonce,
+            );
+            // event.timestamp (validator-assigned at prep) stands in for the
+            // user-signed timestamp: admission freshness bounds the two to the
+            // same window, and the D4.1 retention sweep only needs a
+            // consensus-visible creation time.
+            let marker = crate::user_transfer_nonce::UserTransferNonceV1::new(
+                &auth.signer,
+                &auth.client_nonce,
+                auth.request_digest,
+                &task_subnet.canonical_string(),
+                transfer.amount,
+                event.timestamp,
+            );
+            changes.push(setu_types::event::StateChange {
+                key: crate::user_transfer_nonce::marker_state_key(&marker_id),
+                old_value: None,
+                new_value: Some(marker.to_json_bytes()),
+                target_subnet: Some(setu_types::SubnetId::ROOT),
+            });
+        }
+    }
+
+    changes
+}
+
 fn solver_execution_message(
     events_processed: usize,
     events_failed: usize,
@@ -453,6 +509,7 @@ impl TeeExecutor {
         };
 
         let mut event = task.event.clone();
+        let task_subnet = task.subnet_id;
 
         // 3. Create HTTP request
         let request = ExecuteTaskRequest {
@@ -490,16 +547,11 @@ impl TeeExecutor {
                                     &exec_resp.message,
                                     "",
                                 )),
-                                state_changes: result_dto
-                                    .state_changes
-                                    .iter()
-                                    .map(|sc| setu_types::event::StateChange {
-                                        key: sc.key.clone(),
-                                        old_value: sc.old_value.clone(),
-                                        new_value: sc.new_value.clone(),
-                                        target_subnet: None,
-                                    })
-                                    .collect(),
+                                state_changes: build_execution_state_changes(
+                                    &result_dto.state_changes,
+                                    task_subnet,
+                                    &event,
+                                ),
                             };
 
                             event.set_execution_result(execution_result);
@@ -807,6 +859,7 @@ impl TeeExecutor {
         // Keep Event for later use
         let mut event = task.event.clone();
         let event_id = event.id.clone();
+        let task_subnet = task.subnet_id;
 
         // 3. Create HTTP request
         let request = ExecuteTaskRequest {
@@ -864,16 +917,11 @@ impl TeeExecutor {
                                     &exec_resp.message,
                                     "",
                                 )),
-                                state_changes: result_dto
-                                    .state_changes
-                                    .iter()
-                                    .map(|sc| setu_types::event::StateChange {
-                                        key: sc.key.clone(),
-                                        old_value: sc.old_value.clone(),
-                                        new_value: sc.new_value.clone(),
-                                        target_subnet: None,
-                                    })
-                                    .collect(),
+                                state_changes: build_execution_state_changes(
+                                    &result_dto.state_changes,
+                                    task_subnet,
+                                    &event,
+                                ),
                             };
 
                             event.set_execution_result(execution_result);
@@ -1365,6 +1413,7 @@ impl TeeExecutor {
                 if resp.success {
                     if let Some(ref result_dto) = resp.result {
                         let mut event = entry.event;
+                        let task_subnet = entry.request.solver_task.subnet_id;
                         let execution_result = setu_types::event::ExecutionResult {
                             success: result_dto.events_failed == 0,
                             message: Some(solver_execution_message(
@@ -1374,16 +1423,11 @@ impl TeeExecutor {
                                 &resp.message,
                                 " (batch)",
                             )),
-                            state_changes: result_dto
-                                .state_changes
-                                .iter()
-                                .map(|sc| setu_types::event::StateChange {
-                                    key: sc.key.clone(),
-                                    old_value: sc.old_value.clone(),
-                                    new_value: sc.new_value.clone(),
-                                        target_subnet: None,
-                                })
-                                .collect(),
+                            state_changes: build_execution_state_changes(
+                                &result_dto.state_changes,
+                                task_subnet,
+                                &event,
+                            ),
                         };
 
                         event.set_execution_result(execution_result);
@@ -1443,6 +1487,7 @@ impl TeeExecutor {
                     Ok(exec_resp) if exec_resp.success => {
                         if let Some(result_dto) = exec_resp.result {
                             let mut event = entry.event;
+                            let task_subnet = entry.request.solver_task.subnet_id;
                             let execution_result = setu_types::event::ExecutionResult {
                                 success: result_dto.events_failed == 0,
                                 message: Some(solver_execution_message(
@@ -1452,14 +1497,11 @@ impl TeeExecutor {
                                     &exec_resp.message,
                                     " (fallback-single)",
                                 )),
-                                state_changes: result_dto.state_changes.iter()
-                                    .map(|sc| setu_types::event::StateChange {
-                                        key: sc.key.clone(),
-                                        old_value: sc.old_value.clone(),
-                                        new_value: sc.new_value.clone(),
-                                        target_subnet: None,
-                                    })
-                                    .collect(),
+                                state_changes: build_execution_state_changes(
+                                    &result_dto.state_changes,
+                                    task_subnet,
+                                    &event,
+                                ),
                             };
                             event.set_execution_result(execution_result);
                             event.status = setu_types::event::EventStatus::Executed;
@@ -1538,6 +1580,88 @@ mod tests {
         event.set_execution_result(setu_types::ExecutionResult::success());
         event.status = setu_types::event::EventStatus::Executed;
         event
+    }
+
+    // Test #15 (design §9): solver coin changes are routed to the task's
+    // subnet, never left as None (whose apply fallback can default to ROOT).
+    #[test]
+    fn build_execution_state_changes_targets_task_subnet() {
+        let subnet = setu_types::SubnetId::from_str_id("gaming-subnet");
+        let event = Event::new(
+            setu_types::EventType::Transfer,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        )
+        .with_transfer(setu_types::Transfer::new("tx-1", "0xaa", "0xbb", 100))
+        .with_subnet(subnet);
+
+        let dto_changes = vec![
+            setu_transport::http::StateChangeDto {
+                key: format!("oid:{}", "11".repeat(32)),
+                old_value: Some(vec![1]),
+                new_value: Some(vec![2]),
+            },
+            setu_transport::http::StateChangeDto {
+                key: format!("oid:{}", "22".repeat(32)),
+                old_value: None,
+                new_value: Some(vec![3]),
+            },
+        ];
+
+        let changes = build_execution_state_changes(&dto_changes, subnet, &event);
+        assert_eq!(changes.len(), 2, "no marker without authorization");
+        for change in &changes {
+            assert_eq!(change.target_subnet, Some(subnet));
+        }
+    }
+
+    // Test #16 (design §9): an authorized transfer appends the ROOT nonce
+    // marker create with an oid:{hex} key.
+    #[test]
+    fn build_execution_state_changes_appends_root_nonce_marker() {
+        let subnet = setu_types::SubnetId::from_str_id("gaming-subnet");
+        let transfer = setu_types::Transfer::new("tx-1", "0xaa", "0xbb", 100)
+            .with_authorization(setu_types::TransferAuthorization::new(
+                "0xaa", "nonce-0001", [7u8; 32],
+            ));
+        let event = Event::new(
+            setu_types::EventType::Transfer,
+            vec![],
+            test_vlc_snapshot(),
+            "validator-1".to_string(),
+        )
+        .with_transfer(transfer)
+        .with_subnet(subnet);
+
+        let dto_changes = vec![setu_transport::http::StateChangeDto {
+            key: format!("oid:{}", "11".repeat(32)),
+            old_value: Some(vec![1]),
+            new_value: Some(vec![2]),
+        }];
+
+        let changes = build_execution_state_changes(&dto_changes, subnet, &event);
+        assert_eq!(changes.len(), 2, "marker create must be appended");
+
+        let marker = &changes[1];
+        let expected_id =
+            crate::user_transfer_nonce::nonce_object_id("0xaa", "nonce-0001");
+        assert_eq!(marker.key, crate::user_transfer_nonce::marker_state_key(&expected_id));
+        assert!(marker.key.starts_with("oid:"));
+        assert_eq!(marker.old_value, None, "marker is a create");
+        assert_eq!(
+            marker.target_subnet,
+            Some(setu_types::SubnetId::ROOT),
+            "marker lives in ROOT regardless of the coin subnet"
+        );
+        // Marker value is the JSON shape (classifies StorageFormat::Unknown)
+        let value: serde_json::Value =
+            serde_json::from_slice(marker.new_value.as_ref().unwrap()).unwrap();
+        assert_eq!(value["kind"], "UserTransferNonceV1");
+        assert_eq!(value["subnet_id"], subnet.canonical_string());
+        assert_eq!(value["amount_raw"], 100);
+        // The coin change still targets the task subnet
+        assert_eq!(changes[0].target_subnet, Some(subnet));
     }
 
     fn test_executor() -> (
@@ -1695,6 +1819,7 @@ pub async fn send_solver_task_sync(
 
     // Keep Event for later use
     let mut event = task.event.clone();
+    let task_subnet = task.subnet_id;
 
     // Create request
     let request = ExecuteTaskRequest {
@@ -1773,16 +1898,11 @@ pub async fn send_solver_task_sync(
             &exec_response.message,
             "",
         )),
-        state_changes: result_dto
-            .state_changes
-            .iter()
-            .map(|sc| setu_types::event::StateChange {
-                key: sc.key.clone(),
-                old_value: sc.old_value.clone(),
-                new_value: sc.new_value.clone(),
-                                        target_subnet: None,
-            })
-            .collect(),
+        state_changes: build_execution_state_changes(
+            &result_dto.state_changes,
+            task_subnet,
+            &event,
+        ),
     };
 
     event.set_execution_result(execution_result);

@@ -41,6 +41,9 @@ pub enum RouterError {
     
     #[error("Routing failed: {0}")]
     RoutingFailed(String),
+
+    #[error("Invalid subnet id: {0}")]
+    InvalidSubnet(String),
 }
 
 /// Solver connection info
@@ -294,7 +297,11 @@ impl RouterManager {
     /// Also respects `permitted_subnets` filtering: solvers with non-empty
     /// permitted_subnets only serve listed subnets.
     pub fn route_transfer(&self, transfer: &Transfer) -> Result<String, RouterError> {
-        let subnet_id = transfer.get_subnet_id();
+        // Fallible resolution (design D1): never silently route an invalid
+        // subnet string to ROOT.
+        let subnet_id = transfer
+            .resolve_subnet_id()
+            .map_err(|e| RouterError::InvalidSubnet(e.to_string()))?;
         
         // Priority 1: Manual solver selection (preferred_solver)
         // Check if preferred solver is available AND permits this subnet
@@ -624,9 +631,82 @@ mod tests {
     fn test_no_solver_available() {
         let manager = RouterManager::new();
         let transfer = create_test_transfer("tx-1");
-        
+
         let result = manager.route_transfer(&transfer);
         assert!(matches!(result, Err(RouterError::NoSolverAvailable)));
+    }
+
+    // Test #10 (design §9): invalid subnet id is rejected at routing, never
+    // silently routed as ROOT.
+    #[test]
+    fn test_route_transfer_invalid_subnet_rejected() {
+        let manager = RouterManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        manager.register_solver("solver-1".to_string(), "127.0.0.1:9001".to_string(), 100, tx);
+
+        let mut transfer = create_test_transfer("tx-1");
+        transfer.subnet_id = Some("Bad_Subnet!".to_string());
+
+        let result = manager.route_transfer(&transfer);
+        assert!(
+            matches!(result, Err(RouterError::InvalidSubnet(_))),
+            "invalid subnet must error, got {:?}",
+            result
+        );
+    }
+
+    // Test #11 (design §9): public id and full hex route to the same solver
+    #[test]
+    fn test_route_public_id_and_full_hex_same_subnet() {
+        let manager = RouterManager::new();
+        for i in 1..=3 {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            manager.register_solver(
+                format!("solver-{}", i),
+                format!("127.0.0.1:900{}", i),
+                100,
+                tx,
+            );
+        }
+
+        let canonical = SubnetId::from_str_id("gaming-subnet");
+        let by_public = create_test_transfer("tx-1").with_subnet("gaming-subnet");
+        let by_hex = create_test_transfer("tx-1").with_subnet(canonical.to_full_hex());
+
+        let route_public = manager.route_transfer(&by_public).unwrap();
+        let route_hex = manager.route_transfer(&by_hex).unwrap();
+        assert_eq!(route_public, route_hex, "both forms must use the same routing key");
+    }
+
+    // Test #12 (design §9): dedicated solver registered with a public-id
+    // permitted subnet serves transfers addressing it by either form.
+    #[test]
+    fn test_permitted_subnets_accepts_public_id() {
+        let manager = RouterManager::new();
+        let permitted = SubnetId::parse_public_or_hex("gaming-subnet").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        manager.register_solver_with_affinity(
+            "dedicated-solver".to_string(),
+            "127.0.0.1:9001".to_string(),
+            100,
+            tx,
+            None,
+            None,
+            vec![],
+            vec![permitted],
+        );
+
+        let mut transfer = create_test_transfer("tx-1").with_subnet("gaming-subnet");
+        transfer.preferred_solver = Some("dedicated-solver".to_string());
+        assert_eq!(manager.route_transfer(&transfer).unwrap(), "dedicated-solver");
+
+        // The same dedicated solver must NOT serve a different subnet
+        let mut other = create_test_transfer("tx-2").with_subnet("other-subnet");
+        other.preferred_solver = Some("dedicated-solver".to_string());
+        assert!(
+            manager.route_transfer(&other).is_err(),
+            "dedicated solver must not serve unpermitted subnets"
+        );
     }
     
     // ============================================

@@ -274,11 +274,21 @@ pub struct GlobalStateManager {
     /// efficient lookups for both Coins and Move objects.
     /// The type_tag is coin_type for legacy CoinState, or Move type_tag for ObjectEnvelope.
     owner_object_index: HashMap<String, HashSet<([u8; 32], String)>>,
-    /// Modification tracker: object_id -> last modifying event_id
+    /// Modification tracker: object_id -> (last modifying event_id, finalized depth)
     /// 
     /// Updated during apply_committed_events to track which event last modified
-    /// each object. Used by TaskPreparer to derive DAG parent_ids for causal ordering.
-    modification_tracker: HashMap<[u8; 32], String>,
+    /// each object AND the anchor depth of the CF that finalized it. Used by
+    /// TaskPreparer to derive DAG parent_ids for causal ordering and to drop
+    /// cold parent edges that have aged past the cross-CF window
+    /// (docs/feat/fix-transfer-parent-too-old-general/). In-memory only
+    /// (arch invariant #4) — rebuilt via DAG replay, never persisted.
+    modification_tracker: HashMap<[u8; 32], (String, u64)>,
+    /// Anchor depth of the most recently applied CF.
+    ///
+    /// Updated on every `apply_committed_events`. Serves as a sync, consensus-
+    /// agreed proxy for the DAG depth floor (`DagManager.min_depth`) so the
+    /// preparer can decide cold-parent drops without a consensus handle.
+    last_finalized_depth: u64,
     /// Optional version watcher (B1 wait_min_version API).
     ///
     /// When attached via [`set_version_watcher`](Self::set_version_watcher),
@@ -329,6 +339,9 @@ impl Clone for GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            // Scalar watermark — cheap to preserve and keeps a verify-clone's
+            // cold-parent view consistent with the source GSM.
+            last_finalized_depth: self.last_finalized_depth,
             // Clones are throw-away snapshots — wakeup notifications are scoped
             // to the canonical instance only.
             version_watcher: None,
@@ -363,6 +376,7 @@ impl GlobalStateManager {
             coin_type_index: self.coin_type_index.clone(),
             owner_object_index: self.owner_object_index.clone(),
             modification_tracker: self.modification_tracker.clone(),
+            last_finalized_depth: self.last_finalized_depth,
             // Read snapshots do not fire wakeups; the canonical instance owns
             // the watcher.
             version_watcher: None,
@@ -384,6 +398,7 @@ impl GlobalStateManager {
             coin_type_index: HashMap::new(),
             owner_object_index: HashMap::new(),
             modification_tracker: HashMap::new(),
+            last_finalized_depth: 0,
             version_watcher: None,
         }
     }
@@ -897,15 +912,34 @@ impl GlobalStateManager {
 
     /// Get the last event that modified a given object
     pub fn get_last_modifying_event(&self, object_id: &[u8; 32]) -> Option<&String> {
-        self.modification_tracker.get(object_id)
+        self.modification_tracker.get(object_id).map(|(id, _)| id)
     }
 
-    /// Record that an event modified specific objects
+    /// Get the last event that modified a given object together with the anchor
+    /// depth of the CF that finalized it.
+    ///
+    /// Used by TaskPreparer to drop cold parent edges that have aged past the
+    /// cross-CF window. Returns `None` for objects with no recorded modifier
+    /// (e.g. pre-restart coins before DAG replay repopulates the tracker).
+    pub fn get_last_modifying_event_depth(&self, object_id: &[u8; 32]) -> Option<(&String, u64)> {
+        self.modification_tracker
+            .get(object_id)
+            .map(|(id, depth)| (id, *depth))
+    }
+
+    /// Anchor depth of the most recently applied CF (sync floor proxy).
+    pub fn last_finalized_depth(&self) -> u64 {
+        self.last_finalized_depth
+    }
+
+    /// Record that an event modified a specific object at a given finalized depth
     /// 
-    /// This is called during genesis initialization and after state changes
-    /// are applied via apply_committed_events.
-    pub fn record_modification(&mut self, event_id: &str, object_id: [u8; 32]) {
-        self.modification_tracker.insert(object_id, event_id.to_string());
+    /// This is called during genesis initialization (depth 0) and after state
+    /// changes are applied via apply_committed_events (the finalizing CF's
+    /// anchor depth).
+    pub fn record_modification(&mut self, event_id: &str, object_id: [u8; 32], finalized_depth: u64) {
+        self.modification_tracker
+            .insert(object_id, (event_id.to_string(), finalized_depth));
     }
     
     // =========================================================================
@@ -1096,7 +1130,10 @@ impl GlobalStateManager {
     pub fn apply_committed_events(
         &mut self,
         events: &[Event],
+        finalized_depth: u64,
     ) -> StateApplySummary {
+        // Record the anchor depth of this finalizing CF as the sync floor proxy.
+        self.last_finalized_depth = self.last_finalized_depth.max(finalized_depth);
         // DIAG: mark this thread as "inside authoritative CF apply" so that
         // apply_state_change's out-of-band probe stays silent for every write
         // reached through this path. Drop unsets the gate on any exit
@@ -1248,10 +1285,13 @@ impl GlobalStateManager {
                 // Apply all state changes for this event
                 let new_root = self.apply_execution_result(subnet_id, result);
                 
-                // Update modification_tracker: record event_id for each modified object
+                // Update modification_tracker: record (event_id, finalized_depth)
+                // for each modified object. The depth is the finalizing CF's
+                // anchor depth, used later to drop cold parent edges.
                 for change in &result.state_changes {
                     let object_id = Self::parse_state_change_key(&change.key);
-                    self.modification_tracker.insert(*object_id.as_bytes(), event.id.clone());
+                    self.modification_tracker
+                        .insert(*object_id.as_bytes(), (event.id.clone(), finalized_depth));
                 }
                 
                 // Track in summary
@@ -1319,7 +1359,7 @@ impl GlobalStateManager {
         anchor_id: u64,
     ) -> Result<(AnchorMerkleRoots, StateApplySummary), StateApplyError> {
         // Apply all state changes
-        let summary = self.apply_committed_events(events);
+        let summary = self.apply_committed_events(events, anchor_id);
         
         // Build anchor roots
         let anchor_roots = self.build_anchor_roots(events_root, anchor_chain_root);
@@ -1744,7 +1784,7 @@ mod tests {
         event2.status = setu_types::event::EventStatus::Executed;
         
         // Apply both events (sorted by VLC: T1 first, then T2)
-        let summary = manager.apply_committed_events(&[event1.clone(), event2.clone()]);
+        let summary = manager.apply_committed_events(&[event1.clone(), event2.clone()], 0);
         
         // T1 should succeed
         assert_eq!(summary.total_events, 1, "Only T1 should be applied");
@@ -1769,7 +1809,191 @@ mod tests {
         assert_eq!(smt.get(&bob_oid), Some(&bob_value), "Bob's coin should exist");
         assert_eq!(smt.get(&charlie_oid), None, "Charlie's coin should NOT exist (T2 rejected)");
     }
-    
+
+    /// Marker value bytes matching the validator's `UserTransferNonceV1` JSON
+    /// shape (design D4) — non-BCS on purpose.
+    fn nonce_marker_bytes(nonce: &str) -> Vec<u8> {
+        format!(
+            r#"{{"kind":"UserTransferNonceV1","from":"0xaa","client_nonce":"{}","request_digest":"0x{}","subnet_id":"ROOT","amount_raw":100,"timestamp_ms":1778390000000}}"#,
+            nonce,
+            "07".repeat(32),
+        )
+        .into_bytes()
+    }
+
+    // Test #17 (design §9, R4-PASS-1): a duplicate signed submission whose
+    // ROOT nonce-marker create conflicts is skipped as a WHOLE event — its
+    // coin spend (in an app subnet) is not applied either.
+    #[test]
+    fn test_duplicate_nonce_marker_conflict_skips_whole_event_atomically() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+        let app_subnet = SubnetId::from_str_id("gaming-subnet");
+
+        // Two distinct coins in the app subnet — the duplicate selected a
+        // different coin, so object conflict alone would NOT stop it.
+        let coin1_bytes = [0xA1; 32];
+        let coin2_bytes = [0xA2; 32];
+        let coin_value = vec![1u8; 64];
+        manager.upsert_object(app_subnet, coin1_bytes, coin_value.clone());
+        manager.upsert_object(app_subnet, coin2_bytes, coin_value.clone());
+
+        let marker_key = format!("oid:{}", hex::encode([0x5A; 32]));
+        let marker_value = nonce_marker_bytes("nonce-0001");
+
+        let make_event = |vlc_time: u64, coin_bytes: [u8; 32]| {
+            let mut vlc = VLCSnapshot::new();
+            vlc.logical_time = vlc_time;
+            let mut event = Event::new(EventType::Transfer, vec![], vlc, "validator-1".to_string());
+            event = event.with_subnet(app_subnet);
+            event.set_execution_result(ExecutionResult {
+                success: true,
+                message: None,
+                state_changes: vec![
+                    StateChange::update(
+                        format!("oid:{}", hex::encode(coin_bytes)),
+                        coin_value.clone(),
+                        vec![9u8; 64],
+                    )
+                    .with_target_subnet(app_subnet),
+                    StateChange::insert(marker_key.clone(), marker_value.clone())
+                        .with_target_subnet(SubnetId::ROOT),
+                ],
+            });
+            event.status = setu_types::event::EventStatus::Executed;
+            event
+        };
+
+        let event1 = make_event(1, coin1_bytes);
+        let event2 = make_event(2, coin2_bytes); // same nonce marker, different coin
+
+        let summary = manager.apply_committed_events(&[event1, event2.clone()], 0);
+
+        assert_eq!(summary.total_events, 1, "only the first event applies");
+        assert_eq!(summary.conflicted_events.len(), 1, "duplicate must conflict");
+        assert_eq!(summary.conflicted_events[0].event_id, event2.id);
+        assert_eq!(summary.conflicted_events[0].conflicting_object, marker_key);
+
+        // Atomicity: the duplicate's coin spend was NOT applied
+        let app_smt = manager.get_subnet_mut(app_subnet);
+        let coin2_oid = HashValue::from_slice(&coin2_bytes).unwrap();
+        assert_eq!(
+            app_smt.get(&coin2_oid),
+            Some(&coin_value),
+            "duplicate's coin spend must be skipped together with its marker"
+        );
+        // The marker exists in ROOT exactly once
+        let marker_oid = GlobalStateManager::parse_state_change_key(&marker_key);
+        assert_eq!(manager.root_subnet().get(&marker_oid), Some(&marker_value));
+    }
+
+    // Test #19 (design §9, R6-ISSUE-1): the marker classifies as
+    // StorageFormat::Unknown (the existing JSON-under-oid convention) and
+    // never enters the coin indexes or balance views.
+    #[test]
+    fn test_nonce_marker_unknown_format_not_indexed() {
+        use setu_types::envelope::{detect_and_parse, StorageFormat};
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let marker_value = nonce_marker_bytes("nonce-0002");
+        assert!(
+            matches!(detect_and_parse(&marker_value), StorageFormat::Unknown),
+            "marker JSON must classify as Unknown"
+        );
+
+        let mut manager = GlobalStateManager::new();
+        let owner = format!("0x{}", "ab".repeat(32));
+        let coin = setu_types::coin::CoinState::new(owner.clone(), 1_000);
+        let coin_bytes = [0xC1; 32];
+        manager.upsert_object(SubnetId::ROOT, coin_bytes, coin.to_bytes());
+        manager.register_coin_object(&owner, "ROOT", coin_bytes);
+        let coins_before = manager.get_coin_objects_for_address(&owner).len();
+
+        let mut vlc = VLCSnapshot::new();
+        vlc.logical_time = 1;
+        let mut event = Event::new(EventType::Transfer, vec![], vlc, "validator-1".to_string());
+        event.set_execution_result(ExecutionResult {
+            success: true,
+            message: None,
+            state_changes: vec![
+                StateChange::insert(
+                    format!("oid:{}", hex::encode([0xD7; 32])),
+                    marker_value.clone(),
+                )
+                .with_target_subnet(SubnetId::ROOT),
+            ],
+        });
+        event.status = setu_types::event::EventStatus::Executed;
+
+        let summary = manager.apply_committed_events(&[event], 0);
+        assert_eq!(summary.total_events, 1);
+
+        // Index and balance views unchanged
+        assert_eq!(
+            manager.get_coin_objects_for_address(&owner).len(),
+            coins_before,
+            "owner_object_index must not gain a marker entry"
+        );
+        // Rebuild from SMT also skips the marker
+        manager.rebuild_coin_type_index();
+        assert_eq!(
+            manager.get_coin_objects_for_address(&owner).len(),
+            coins_before,
+            "index rebuild must skip Unknown-format markers"
+        );
+    }
+
+    // Test #22 (design §9, Q1): same account, different nonces → distinct
+    // marker ids; both events finalize, no account-level serialization.
+    #[test]
+    fn test_same_account_different_nonce_markers_apply_in_parallel() {
+        use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
+
+        let mut manager = GlobalStateManager::new();
+        let coin1_bytes = [0xE1; 32];
+        let coin2_bytes = [0xE2; 32];
+        let coin_value = vec![1u8; 64];
+        manager.upsert_object(SubnetId::ROOT, coin1_bytes, coin_value.clone());
+        manager.upsert_object(SubnetId::ROOT, coin2_bytes, coin_value.clone());
+
+        let marker1_key = format!("oid:{}", hex::encode([0xF1; 32]));
+        let marker2_key = format!("oid:{}", hex::encode([0xF2; 32]));
+
+        let make_event = |vlc_time: u64, coin_bytes: [u8; 32], marker_key: &str, nonce: &str| {
+            let mut vlc = VLCSnapshot::new();
+            vlc.logical_time = vlc_time;
+            let mut event = Event::new(EventType::Transfer, vec![], vlc, "validator-1".to_string());
+            event.set_execution_result(ExecutionResult {
+                success: true,
+                message: None,
+                state_changes: vec![
+                    StateChange::update(
+                        format!("oid:{}", hex::encode(coin_bytes)),
+                        coin_value.clone(),
+                        vec![9u8; 64],
+                    ),
+                    StateChange::insert(marker_key.to_string(), nonce_marker_bytes(nonce))
+                        .with_target_subnet(SubnetId::ROOT),
+                ],
+            });
+            event.status = setu_types::event::EventStatus::Executed;
+            event
+        };
+
+        let event1 = make_event(1, coin1_bytes, &marker1_key, "nonce-0001");
+        let event2 = make_event(2, coin2_bytes, &marker2_key, "nonce-0002");
+
+        let summary = manager.apply_committed_events(&[event1, event2], 0);
+        assert_eq!(summary.total_events, 2, "both transfers must finalize");
+        assert!(summary.conflicted_events.is_empty(), "no conflict between distinct nonces");
+
+        let marker1_oid = GlobalStateManager::parse_state_change_key(&marker1_key);
+        let marker2_oid = GlobalStateManager::parse_state_change_key(&marker2_key);
+        assert!(manager.root_subnet().get(&marker1_oid).is_some());
+        assert!(manager.root_subnet().get(&marker2_oid).is_some());
+    }
+
     #[test]
     fn test_apply_committed_events_no_conflict_when_different_objects() {
         use setu_types::event::{Event, EventType, ExecutionResult, StateChange, VLCSnapshot};
@@ -1812,7 +2036,7 @@ mod tests {
         });
         event2.status = setu_types::event::EventStatus::Executed;
         
-        let summary = manager.apply_committed_events(&[event1, event2]);
+        let summary = manager.apply_committed_events(&[event1, event2], 0);
         
         // Both should succeed - no conflicts
         assert_eq!(summary.total_events, 2);
@@ -1846,7 +2070,7 @@ mod tests {
         });
         event.status = setu_types::event::EventStatus::Executed;
         
-        let summary = manager.apply_committed_events(&[event]);
+        let summary = manager.apply_committed_events(&[event], 0);
         
         assert_eq!(summary.total_events, 1);
         assert!(summary.conflicted_events.is_empty());
@@ -1908,7 +2132,7 @@ mod tests {
         });
         t2.status = setu_types::event::EventStatus::Executed;
 
-        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()]);
+        let summary = manager.apply_committed_events(&[t1.clone(), t2.clone()], 0);
 
         assert_eq!(summary.total_events, 1, "Only T1 should commit");
         assert_eq!(summary.conflicted_events.len(), 1, "T2 must be rejected as concurrent-swap conflict");
@@ -1959,7 +2183,7 @@ mod tests {
         });
         t2.status = setu_types::event::EventStatus::Executed;
 
-        let summary = manager.apply_committed_events(&[t1, t2]);
+        let summary = manager.apply_committed_events(&[t1, t2], 0);
 
         assert_eq!(summary.total_events, 2, "Both events must commit");
         assert!(summary.conflicted_events.is_empty(),

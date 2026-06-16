@@ -122,28 +122,22 @@ impl TaskPreparer {
         subnet_id: SubnetId,
     ) -> Result<SolverTask, TaskPrepareError> {
         let amount = transfer.amount;
-        
-        // Use subnet_id as the coin namespace (1:1 binding)
-        // For ROOT subnet, use "ROOT" as the identifier
-        let subnet_id_str = if subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        };
-        
+
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            subnet_id = %subnet_id_str,
+            subnet_id = %subnet_id.canonical_string(),
             "Preparing SolverTask for transfer"
         );
-        
-        // Step 1: Select coins for sender filtered by subnet_id
-        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+
+        // Step 1: Select sender coins by canonical subnet compare (design
+        // D8.2): coin namespace identity is the resolved SubnetId, never a
+        // string match against a display form.
+        let sender_coins = self.state_provider.get_coins_for_address_in_subnet(
             &transfer.from,
-            &subnet_id_str,
+            &subnet_id,
         );
         let selection = self.select_coins_for_transfer(&sender_coins, amount)?;
 
@@ -193,11 +187,11 @@ impl TaskPreparer {
         // Step 4: Build read_set with Merkle proof
         // Pass raw storage data (CoinState) so TEE can verify Merkle proof
         // TEE is responsible for converting CoinState → Object<CoinData>
-        let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+        let coin_data = self.state_provider.get_object_from_subnet(&selected_coin.object_id, &subnet_id)
             .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
-        
-        let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
-        
+
+        let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(&selected_coin.object_id, &subnet_id);
+
         let mut read_set = vec![
             ReadSetEntry::new(
                 format!("oid:{}", hex::encode(&selected_coin.object_id)),
@@ -238,7 +232,7 @@ impl TaskPreparer {
         }
         
         // Step 5: Create Event from Transfer with derived dependencies
-        let event = self.create_event_from_transfer(transfer, parent_ids)?;
+        let event = self.create_event_from_transfer(transfer, parent_ids, subnet_id)?;
         
         // Step 6: Get pre-state root
         let pre_state_root = self.state_provider.get_state_root();
@@ -291,32 +285,25 @@ impl TaskPreparer {
         reservation_mgr: &crate::coin_reservation::CoinReservationManager,
     ) -> Result<(SolverTask, Vec<crate::coin_reservation::ReservationHandle>), TaskPrepareError> {
         let amount = transfer.amount;
-        
-        // Use subnet_id as the coin namespace (1:1 binding)
-        let subnet_id_str = if subnet_id == SubnetId::ROOT {
-            "ROOT".to_string()
-        } else {
-            subnet_id.to_string()
-        };
-        
+
         debug!(
             transfer_id = %transfer.id,
             from = %transfer.from,
             to = %transfer.to,
             amount = amount,
-            subnet_id = %subnet_id_str,
+            subnet_id = %subnet_id.canonical_string(),
             "Preparing SolverTask with reservation"
         );
-        
-        // Step 1: Get all coins for sender filtered by subnet_id
-        let sender_coins = self.state_provider.get_coins_for_address_by_type(
+
+        // Step 1: Select sender coins by canonical subnet compare (design D8.2)
+        let sender_coins = self.state_provider.get_coins_for_address_in_subnet(
             &transfer.from,
-            &subnet_id_str,
+            &subnet_id,
         );
-        
+
         if sender_coins.is_empty() {
             return Err(TaskPrepareError::NoCoinsFound(
-                format!("sender {} has no coins in subnet {}", transfer.from, subnet_id_str)
+                format!("sender {} has no coins in subnet {}", transfer.from, subnet_id.canonical_string())
             ));
         }
 
@@ -369,9 +356,9 @@ impl TaskPreparer {
                 let input_objects: Vec<&setu_types::ObjectId> = vec![&selected_coin.object_id];
                 let parent_ids = self.derive_dependencies(&input_objects);
 
-                let coin_data = self.state_provider.get_object(&selected_coin.object_id)
+                let coin_data = self.state_provider.get_object_from_subnet(&selected_coin.object_id, &subnet_id)
                     .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(&selected_coin.object_id)))?;
-                let merkle_proof = self.state_provider.get_merkle_proof(&selected_coin.object_id);
+                let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(&selected_coin.object_id, &subnet_id);
                 let mut read_set = vec![
                     setu_types::task::ReadSetEntry::new(
                         format!("oid:{}", hex::encode(&selected_coin.object_id)),
@@ -411,7 +398,7 @@ impl TaskPreparer {
                     ));
                 }
 
-                let event = self.create_event_from_transfer(transfer, parent_ids)?;
+                let event = self.create_event_from_transfer(transfer, parent_ids, subnet_id)?;
                 let pre_state_root = self.state_provider.get_state_root();
                 let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
 
@@ -502,7 +489,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&all_ids)?;
+        let read_set = self.build_read_set(&all_ids, &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -515,6 +502,7 @@ impl TaskPreparer {
             target_coin_id: hex::encode(&target_coin.object_id),
             source_coin_ids: source_coins.iter().map(|c| hex::encode(&c.object_id)).collect(),
         };
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -571,7 +559,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = vec![&source_coin.object_id];
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&[source_coin.object_id])?;
+        let read_set = self.build_read_set(&[source_coin.object_id], &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -584,6 +572,7 @@ impl TaskPreparer {
             source_coin_id: hex::encode(&source_coin.object_id),
             amounts,
         };
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -654,7 +643,7 @@ impl TaskPreparer {
         let input_refs: Vec<&ObjectId> = all_ids.iter().collect();
         let parent_ids = self.derive_dependencies(&input_refs);
 
-        let read_set = self.build_read_set(&all_ids)?;
+        let read_set = self.build_read_set(&all_ids, &subnet_id)?;
 
         let vlc_snapshot = self.generate_vlc_snapshot();
         let mut event = Event::new(
@@ -669,6 +658,8 @@ impl TaskPreparer {
             recipient: recipient.to_string(),
             amount,
         };
+        // Mandatory on BOTH transfer prep paths (design D8.7, R4-ISSUE-4)
+        event = event.with_subnet(subnet_id);
 
         let pre_state_root = self.state_provider.get_state_root();
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -688,15 +679,18 @@ impl TaskPreparer {
     }
 
     /// Build read_set entries for a list of object IDs.
+    ///
+    /// Object bytes and proof are read from the same subnet SMT (design D8.3/D8.4).
     fn build_read_set(
         &self,
         object_ids: &[ObjectId],
+        subnet_id: &SubnetId,
     ) -> Result<Vec<ReadSetEntry>, TaskPrepareError> {
         let mut read_set = Vec::with_capacity(object_ids.len());
         for oid in object_ids {
-            let coin_data = self.state_provider.get_object(oid)
+            let coin_data = self.state_provider.get_object_from_subnet(oid, subnet_id)
                 .ok_or(TaskPrepareError::ObjectNotFound(hex::encode(oid)))?;
-            let merkle_proof = self.state_provider.get_merkle_proof(oid);
+            let merkle_proof = self.state_provider.get_merkle_proof_from_subnet(oid, subnet_id);
             read_set.push(
                 ReadSetEntry::new(
                     format!("oid:{}", hex::encode(oid)),
@@ -819,6 +813,7 @@ impl TaskPreparer {
         &self,
         transfer: &setu_types::Transfer,
         parent_ids: Vec<String>,
+        subnet_id: SubnetId,
     ) -> Result<Event, TaskPrepareError> {
         // Use the VLC assigned by Validator (from transfer) to ensure unique event_id
         // If no assigned_vlc, fall back to timestamp-based VLC (but this shouldn't happen in production)
@@ -855,10 +850,16 @@ impl TaskPreparer {
             vlc_snapshot,
             self.validator_id.clone(),
         );
-        
+
         // Attach transfer data (clone it)
         event = event.with_transfer(transfer.clone());
-        
+
+        // Mandatory (design D8.7/D9.3, R4-ISSUE-4): the apply fallback for a
+        // change without target_subnet is event.get_subnet_id(), which
+        // defaults to ROOT — an unset event subnet silently routes subnet
+        // coins into ROOT.
+        event = event.with_subnet(subnet_id);
+
         Ok(event)
     }
     
@@ -866,21 +867,65 @@ impl TaskPreparer {
     ///
     /// For each input object, find the last event that modified it.
     /// These events become the parent_ids (dependencies) of the new event.
+    ///
+    /// Two edges are dropped at preparation time (baked into the signed event,
+    /// so the dropped set is deterministic across nodes):
+    /// 1. The **genesis** edge (unconditional fast-path): a never-moved coin
+    ///    references the depth-0 genesis event, which trips `ParentTooOld` once
+    ///    the floor advances past `max_cross_cf_depth`.
+    /// 2. Any **cold** non-genesis edge whose modifying event has aged
+    ///    `floor − depth ≥ COLD_PARENT_DROP_THRESHOLD` (= 150): a long-idle coin
+    ///    moved once, went quiet, and its last modifier slid below the GC window.
+    ///
+    /// Double-spend safety is independent of these edges (enforced by the
+    /// `old_value` conflict check at apply time), so dropping them is safe.
+    /// See docs/feat/fix-transfer-parent-too-old-general/design.md.
     fn derive_dependencies(&self, input_objects: &[&ObjectId]) -> Vec<String> {
+        use super::COLD_PARENT_DROP_THRESHOLD;
+
         let mut parent_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        
+        let genesis_id = Event::genesis_event_id();
+        let floor = self.state_provider.current_finalized_depth();
+
         for object_id in input_objects {
-            if let Some(event_id) = self.state_provider.get_last_modifying_event(object_id) {
-                // Deduplicate: same event might have modified multiple objects
-                if seen.insert(event_id.clone()) {
-                    debug!(
-                        object_id = %object_id,
-                        parent_event = %event_id,
-                        "Found dependency from input object"
-                    );
-                    parent_ids.push(event_id);
-                }
+            // Read (event_id, finalized_depth) together so the cold-parent
+            // decision uses the same recorded depth across all nodes.
+            let Some((event_id, depth)) =
+                self.state_provider.get_last_modifying_event_depth(object_id)
+            else {
+                continue;
+            };
+
+            // (1) Unconditional genesis drop (depth-0 constant, no aging check).
+            if event_id == genesis_id {
+                debug!(
+                    object_id = %object_id,
+                    "Dropping genesis parent edge for never-moved coin"
+                );
+                continue;
+            }
+
+            // (2) Cold non-genesis drop: aged past the cross-CF window proxy.
+            if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+                debug!(
+                    object_id = %object_id,
+                    parent_event = %event_id,
+                    parent_depth = depth,
+                    floor = floor,
+                    "Dropping cold parent edge (aged past cross-CF window)"
+                );
+                continue;
+            }
+
+            // Deduplicate: same event might have modified multiple objects
+            if seen.insert(event_id.clone()) {
+                debug!(
+                    object_id = %object_id,
+                    parent_event = %event_id,
+                    "Found dependency from input object"
+                );
+                parent_ids.push(event_id);
             }
         }
         
@@ -1784,6 +1829,147 @@ mod tests {
             version: 1,
             coin_type: "ROOT".to_string(),
         }
+    }
+
+    /// Mock provider that returns a caller-supplied `last_modifying_event` per
+    /// object id, so `derive_dependencies` can be tested in isolation.
+    struct FixedParentProvider {
+        last_modifier: std::collections::HashMap<ObjectId, String>,
+    }
+
+    impl StateProvider for FixedParentProvider {
+        fn get_coins_for_address(&self, _address: &str) -> Vec<CoinInfo> {
+            Vec::new()
+        }
+        fn get_object(&self, _object_id: &ObjectId) -> Option<Vec<u8>> {
+            None
+        }
+        fn get_state_root(&self) -> [u8; 32] {
+            [0u8; 32]
+        }
+        fn get_merkle_proof(&self, _object_id: &ObjectId) -> Option<crate::SimpleMerkleProof> {
+            None
+        }
+        fn get_last_modifying_event(&self, object_id: &ObjectId) -> Option<String> {
+            self.last_modifier.get(object_id).cloned()
+        }
+    }
+
+    /// Fresh (non-singleton) provider with subnet-native coins for alice,
+    /// stored in the app subnet SMT under the public-id coin_type.
+    fn make_subnet_provider(
+        public_id: &str,
+        total_balance: u64,
+        num_coins: u32,
+    ) -> Arc<setu_storage::MerkleStateProvider> {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider, init_coins_split};
+        let shared = Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut manager = shared.lock_write();
+            init_coins_split(&mut manager, "alice", total_balance, num_coins, public_id);
+            shared.publish_snapshot(&manager);
+        }
+        Arc::new(MerkleStateProvider::new(shared))
+    }
+
+    // Test #13 (design §9): coin stored under public-id coin_type is selected
+    // via full-hex input through canonical compare; coin bytes + proof come
+    // from the subnet SMT, not from string equality against a display form.
+    #[test]
+    fn test_prepare_transfer_selects_subnet_coin_via_canonical_compare() {
+        let provider = make_subnet_provider("gaming-subnet", 500, 1);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet");
+        let transfer = Transfer::new("tx-subnet-1", "alice", "bob", 100)
+            .with_subnet(canonical.to_full_hex()); // full-hex addressing
+        let subnet_id = transfer.resolve_subnet_id().unwrap();
+        assert_eq!(subnet_id, canonical);
+
+        let task = preparer
+            .prepare_transfer_task(&transfer, subnet_id)
+            .expect("subnet coin must be selected via canonical compare");
+
+        assert_eq!(task.subnet_id, canonical);
+        // Coin read came from the subnet SMT and carries a proof
+        let coin_entry = &task.read_set[0];
+        assert!(coin_entry.key.starts_with("oid:"));
+        assert!(!coin_entry.value.is_empty());
+        assert!(
+            coin_entry.proof.as_ref().is_some_and(|p| !p.is_empty()),
+            "subnet proof must be present"
+        );
+    }
+
+    // Test #14 (design §9): event.subnet_id is set on BOTH the direct path
+    // and the CoinMergeThenTransfer path (R4-ISSUE-4).
+    #[test]
+    fn test_event_subnet_set_on_direct_and_merge_paths() {
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet");
+
+        // Direct path: one coin covers the amount
+        let provider = make_subnet_provider("gaming-subnet", 500, 1);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+        let transfer = Transfer::new("tx-direct", "alice", "bob", 100)
+            .with_subnet("gaming-subnet");
+        let task = preparer
+            .prepare_transfer_task(&transfer, transfer.resolve_subnet_id().unwrap())
+            .expect("direct transfer prep");
+        assert_eq!(
+            task.event.subnet_id,
+            Some(canonical),
+            "direct path must set event.subnet_id"
+        );
+
+        // Merge path: split alice's balance into 5 coins so no single coin
+        // covers the amount → auto-escalates to CoinMergeThenTransfer
+        let provider = make_subnet_provider("gaming-subnet", 250, 5);
+        let preparer = TaskPreparer::new("validator-1".to_string(), provider);
+        let transfer = Transfer::new("tx-merge", "alice", "bob", 120)
+            .with_subnet("gaming-subnet");
+        let task = preparer
+            .prepare_transfer_task(&transfer, transfer.resolve_subnet_id().unwrap())
+            .expect("merge-then-transfer prep");
+        assert_eq!(task.event.event_type, EventType::CoinMergeThenTransfer);
+        assert_eq!(
+            task.event.subnet_id,
+            Some(canonical),
+            "CoinMergeThenTransfer path must set event.subnet_id"
+        );
+    }
+
+    /// The genesis parent edge must be dropped (it is depth-0 and trips
+    /// `ParentTooOld` once the floor advances), while a normal parent is kept.
+    /// Guards docs/feat/fix-transfer-parent-too-old.
+    #[test]
+    fn test_derive_dependencies_drops_genesis_parent() {
+        let cold = ObjectId::new([0xAA; 32]); // never moved since genesis
+        let warm = ObjectId::new([0xBB; 32]); // moved by a normal event
+        let normal_parent = "a".repeat(64);
+
+        let mut last_modifier = std::collections::HashMap::new();
+        last_modifier.insert(cold, Event::genesis_event_id());
+        last_modifier.insert(warm, normal_parent.clone());
+
+        let preparer = TaskPreparer::new(
+            "validator-1".to_string(),
+            Arc::new(FixedParentProvider { last_modifier }),
+        );
+
+        // Cold coin alone → genesis parent dropped → empty parent set.
+        assert!(preparer.derive_dependencies(&[&cold]).is_empty());
+
+        // Warm coin alone → normal parent kept.
+        assert_eq!(
+            preparer.derive_dependencies(&[&warm]),
+            vec![normal_parent.clone()]
+        );
+
+        // Mixed → only the normal parent survives.
+        assert_eq!(
+            preparer.derive_dependencies(&[&cold, &warm]),
+            vec![normal_parent]
+        );
     }
     
     #[test]

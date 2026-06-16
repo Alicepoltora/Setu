@@ -1067,7 +1067,7 @@ mod tests {
 
         {
             let mut state_manager = shared.lock_write();
-            let summary = state_manager.apply_committed_events(&[first_event]);
+            let summary = state_manager.apply_committed_events(&[first_event], 0);
             assert!(summary.conflicted_events.is_empty());
             shared.publish_snapshot(&state_manager);
         }

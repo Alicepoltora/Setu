@@ -596,8 +596,23 @@ impl ConsensusValidator {
         // TEE attestation verification is done by the TeeVerifier when enabled
         if let Some(ref exec_result) = event.execution_result {
             if !exec_result.success {
+                // Propagate the solver's real failure reason (joined `failure_reasons`)
+                // instead of an opaque generic string. Without this, every solver
+                // execution failure (Invalid address, insufficient balance, etc.)
+                // collapses into one indistinguishable message at the API boundary,
+                // masking distinct root causes (see docs/bugs/20260602-solver-exec-reason-swallowed.md).
+                let reason = exec_result
+                    .message
+                    .as_deref()
+                    .unwrap_or("execution failed without a reported reason");
+                warn!(
+                    event_id = %event.id,
+                    creator = %event.creator,
+                    reason = %reason,
+                    "Rejecting event: solver execution result is not successful"
+                );
                 return Err(SetuError::InvalidData(
-                    "Event execution result is not successful".to_string()
+                    format!("Event execution failed: {}", reason)
                 ));
             }
         }
@@ -781,6 +796,36 @@ impl ConsensusValidator {
     /// Get the current round number
     pub async fn current_round(&self) -> Round {
         self.engine.current_round().await
+    }
+
+    /// Build a read-only consensus-finality snapshot for `/health` telemetry.
+    ///
+    /// Reads only existing in-memory consensus state (no writes). The monotonic
+    /// fields (`consensus_round`, `anchor_depth`) are the alerting targets;
+    /// `finalized_cf_buffer_len` is GC-bounded (<=1000) and must not be used
+    /// for progress detection.
+    pub async fn consensus_health_snapshot(&self) -> setu_api::ConsensusHealth {
+        let consensus_round = self.engine.current_round().await;
+        let strict_vote_signatures = self.engine.strict_vote_signatures_enabled();
+
+        let cm = self.engine.consensus_manager().read().await;
+        let finalized_cf_buffer_len = cm.finalized_count();
+        let pending_cf_count = cm.pending_cfs_len();
+        let (last_finalized_anchor_id, last_finalized_anchor_depth) = match cm.last_finalized_cf() {
+            Some(cf) => (Some(cf.anchor.id.clone()), Some(cf.anchor.depth)),
+            None => (None, None),
+        };
+        let anchor_depth = cm.anchor_builder().anchor_depth();
+
+        setu_api::ConsensusHealth {
+            consensus_round,
+            anchor_depth,
+            last_finalized_anchor_id,
+            last_finalized_anchor_depth,
+            finalized_cf_buffer_len,
+            pending_cf_count,
+            strict_vote_signatures,
+        }
     }
     
     /// Get the leader for a specific round
@@ -1190,6 +1235,66 @@ mod tests {
         assert_eq!(stats.node_count, 1);
     }
 
+    /// Phase 0 (fix-transfer-parent-too-old): a failed solver execution result
+    /// must surface the solver's real reason, not the old opaque generic string.
+    #[tokio::test]
+    async fn test_submit_event_failed_execution_propagates_reason() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let mut event = create_test_event("solver-1");
+        // `execution_result` is not part of compute_id, so verify_id() still holds.
+        event.execution_result = Some(setu_types::ExecutionResult {
+            success: false,
+            message: Some(
+                "1 events failed out of 1: Invalid address: 0x3003dcf5b1edaf47344b23660ce5b038301ee292c3e"
+                    .to_string(),
+            ),
+            state_changes: vec![],
+        });
+
+        let err = validator
+            .submit_event(event)
+            .await
+            .expect_err("failed execution must be rejected");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("Invalid address"),
+            "rejection must propagate the solver reason, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Event execution result is not successful"),
+            "rejection must not use the old opaque generic string, got: {msg}"
+        );
+    }
+
+    /// Phase 0: when the solver reports failure without a message (should never
+    /// happen given tee.rs always fills it, but defended), fall back gracefully.
+    #[tokio::test]
+    async fn test_submit_event_failed_execution_none_message_fallback() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let mut event = create_test_event("solver-1");
+        event.execution_result = Some(setu_types::ExecutionResult {
+            success: false,
+            message: None,
+            state_changes: vec![],
+        });
+
+        let err = validator
+            .submit_event(event)
+            .await
+            .expect_err("failed execution must be rejected");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("execution failed without a reported reason"),
+            "missing reason must fall back to a descriptive default, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_round_advancement() {
         let config = create_test_config();
@@ -1210,6 +1315,33 @@ mod tests {
         assert_eq!(stats.validator_id, "test-validator");
         assert!(stats.is_leader);
         assert_eq!(stats.current_round, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_health_snapshot_fresh() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        let health = validator.consensus_health_snapshot().await;
+        // Fresh node: nothing finalized yet, monotonic fields at zero.
+        assert_eq!(health.consensus_round, 0);
+        assert_eq!(health.anchor_depth, 0);
+        assert_eq!(health.last_finalized_anchor_id, None);
+        assert_eq!(health.last_finalized_anchor_depth, None);
+        assert_eq!(health.finalized_cf_buffer_len, 0);
+        assert_eq!(health.pending_cf_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_health_snapshot_strict_flag_tracks_engine() {
+        let config = create_test_config();
+        let validator = ConsensusValidator::new(config);
+
+        // Constructors are permissive by default; enabling strict enforcement
+        // must be reflected in the health snapshot.
+        validator.engine().enable_strict_vote_signatures();
+        let after = validator.consensus_health_snapshot().await;
+        assert!(after.strict_vote_signatures);
     }
 
     #[tokio::test]

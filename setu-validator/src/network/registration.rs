@@ -25,36 +25,9 @@ pub struct ValidatorRegistrationHandler {
 }
 
 fn validate_public_subnet_id(raw: &str) -> Result<String, &'static str> {
-    let value = raw.trim();
-    if value.is_empty() {
-        return Err("Invalid subnet_id: must not be empty");
-    }
-    if value != raw {
-        return Err("Invalid subnet_id: leading/trailing whitespace is not allowed");
-    }
-    if value.len() < 3 || value.len() > 64 {
-        return Err("Invalid subnet_id: length must be 3-64 characters");
-    }
-    if value.eq_ignore_ascii_case("root") || value.eq_ignore_ascii_case("governance") {
-        return Err("Invalid subnet_id: reserved system id");
-    }
-
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return Err("Invalid subnet_id: must not be empty");
-    };
-    let last = value.chars().last().unwrap_or(first);
-    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
-        return Err("Invalid subnet_id: must start and end with a letter or digit");
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-    {
-        return Err("Invalid subnet_id: only lowercase letters, digits, and '-' are allowed");
-    }
-
-    Ok(value.to_string())
+    // Grammar lives in types so the D1 resolver and registration cannot drift.
+    setu_types::SubnetId::validate_public_id_grammar(raw)?;
+    Ok(raw.to_string())
 }
 
 fn validate_public_subnet_name(raw: &str) -> Result<String, &'static str> {
@@ -463,6 +436,8 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
 
         self.service.add_subnet(SubnetInfo {
+            canonical_id: setu_types::SubnetId::parse_public_or_hex(&subnet_id)
+                .unwrap_or_else(|_| setu_types::SubnetId::from_str_id(&subnet_id)),
             subnet_id: subnet_id.clone(),
             name: subnet_name,
             owner: request.owner.clone(),
@@ -522,9 +497,13 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         );
 
         // Check if the solver is known to the RouterManager.
-        // After a validator restart, the RouterManager is empty — solvers that
-        // were previously registered will send heartbeats but we won't find
-        // them. Return acknowledged=false so the solver knows to re-register.
+        // `acknowledged` means "recognized as locally routable on THIS validator",
+        // not "alive". After a validator restart the RouterManager is empty —
+        // solvers that were previously registered will send heartbeats but won't
+        // be found here. Return acknowledged=false so the solver re-registers.
+        // Note: behind a round-robin gateway this can flip per request; solver
+        // lifecycle traffic should be pinned to the owner validator (see
+        // docs/feat/solver-local-resource-model/design.md).
         let is_known = self.service
             .router_manager()
             .get_solver(&request.node_id)
@@ -566,15 +545,25 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
                     true
                 }
             })
-            .map(|s| SolverListItem {
-                solver_id: s.solver_id,
-                address: s.address.clone(),
-                port: s.port,
-                account_address: None,
-                capacity: s.capacity,
-                current_load: 0,
-                status: s.status,
-                shard_id: s.shard_id,
+            .map(|s| {
+                // Routability is validator-local: a solver is only routable if it
+                // lives in THIS validator's RouterManager. Registry membership
+                // (s being present) does not imply routability (e.g. replayed-only
+                // entries after restart, before the solver re-registers).
+                let routed = self.service.router_manager().get_solver(&s.solver_id);
+                let routable = routed.is_some();
+                let current_load = routed.map(|r| r.current_load).unwrap_or(0);
+                SolverListItem {
+                    solver_id: s.solver_id,
+                    address: s.address.clone(),
+                    port: s.port,
+                    account_address: None,
+                    capacity: s.capacity,
+                    current_load,
+                    status: s.status,
+                    shard_id: s.shard_id,
+                    routable,
+                }
             })
             .collect();
 
@@ -658,3 +647,98 @@ impl RegistrationHandler for ValidatorRegistrationHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod solver_routable_tests {
+    use super::*;
+    use setu_api::ValidatorService;
+    use setu_rpc::RegistrationHandler;
+
+    fn make_service() -> Arc<ValidatorNetworkService> {
+        let router_manager = Arc::new(crate::RouterManager::new());
+        let task_preparer =
+            Arc::new(crate::TaskPreparer::new_for_testing("test-validator".to_string()));
+        let batch_task_preparer =
+            Arc::new(crate::BatchTaskPreparer::new_for_testing("test-validator".to_string()));
+        let config = crate::NetworkServiceConfig::default();
+        Arc::new(ValidatorNetworkService::new(
+            "test-validator".to_string(),
+            router_manager,
+            task_preparer,
+            batch_task_preparer,
+            config,
+        ))
+    }
+
+    fn solver_request(id: &str) -> RegisterSolverRequest {
+        RegisterSolverRequest {
+            solver_id: id.to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 9000,
+            account_address: "0xabc".to_string(),
+            public_key: vec![],
+            signature: vec![],
+            capacity: 8,
+            shard_id: None,
+            assigned_shard: None,
+            resources: vec![],
+            permitted_subnets: vec![],
+        }
+    }
+
+    /// A live-registered solver is both counted as routable and appears with
+    /// `routable = true` in the solver list.
+    #[tokio::test]
+    async fn tc_routable_when_in_router() {
+        let service = make_service();
+        // register_solver_internal populates BOTH solver_info and RouterManager.
+        service.register_solver_internal(&solver_request("solver-A"));
+
+        assert_eq!(service.registered_solver_count(), 1);
+        assert_eq!(service.router_manager().solver_count(), 1);
+
+        let handler = ValidatorRegistrationHandler {
+            service: Arc::clone(&service),
+        };
+        let resp = handler
+            .get_solver_list(GetSolverListRequest {
+                shard_id: None,
+                status_filter: None,
+            })
+            .await;
+        assert_eq!(resp.solvers.len(), 1);
+        assert!(resp.solvers[0].routable, "live solver must be routable");
+    }
+
+    /// A solver present in the registry (`solver_info`) but absent from this
+    /// validator's RouterManager — simulating a replayed-only entry after
+    /// restart — reports `routable = false` while still being listed.
+    #[tokio::test]
+    async fn tc_not_routable_when_router_evicted() {
+        let service = make_service();
+        service.register_solver_internal(&solver_request("solver-B"));
+
+        // Evict only from the routing layer (registry entry survives), mimicking
+        // a replayed-only solver before it re-registers.
+        service.router_manager().unregister_solver("solver-B");
+
+        assert_eq!(service.registered_solver_count(), 1);
+        assert_eq!(service.router_manager().solver_count(), 0);
+
+        let handler = ValidatorRegistrationHandler {
+            service: Arc::clone(&service),
+        };
+        let resp = handler
+            .get_solver_list(GetSolverListRequest {
+                shard_id: None,
+                status_filter: None,
+            })
+            .await;
+        assert_eq!(resp.solvers.len(), 1);
+        assert!(
+            !resp.solvers[0].routable,
+            "registry-only solver must report routable = false"
+        );
+    }
+}
+

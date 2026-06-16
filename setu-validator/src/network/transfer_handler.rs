@@ -112,7 +112,7 @@ impl TransferHandler {
             request.resources.clone()
         };
 
-        let transfer = Transfer::new(
+        let mut transfer = Transfer::new(
             &transfer_id,
             &request.from,
             &request.to,
@@ -125,15 +125,27 @@ impl TransferHandler {
         .with_shard_id(request.shard_id.clone())
         .with_subnet_id(request.subnet_id.clone())
         .with_assigned_vlc(assigned_vlc);
+        if let Some(authorization) = request.authorization.clone() {
+            transfer = transfer.with_authorization(authorization);
+        }
 
         // Step 4a: Prepare SolverTask WITH COIN RESERVATION
         // This prevents double-spend between concurrent single/batch API calls
-        let subnet_id = match &transfer.subnet_id {
-            Some(subnet_str) if subnet_str != "subnet-0" => {
-                warn!(subnet = %subnet_str, "Custom subnet not supported, using ROOT");
-                setu_types::SubnetId::ROOT
+        //
+        // Subnet resolution is fallible (design D1/D10): invalid input is
+        // rejected here, never silently mapped to ROOT.
+        let subnet_id = match transfer.resolve_subnet_id() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(subnet = ?transfer.subnet_id, error = %e, "Transfer rejected: invalid subnet id");
+                return Self::fail_transfer(
+                    transfer_id,
+                    &format!("Invalid subnet_id: {}", e),
+                    steps,
+                    now,
+                    transfer_status,
+                );
             }
-            _ => setu_types::SubnetId::ROOT,
         };
 
         let (solver_task, reservation_handles) = match task_preparer.prepare_transfer_task_with_reservation(

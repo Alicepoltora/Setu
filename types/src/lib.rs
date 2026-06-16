@@ -1,5 +1,6 @@
 // ========== Core Modules ==========
 pub mod hash_utils;     // Unified hash utilities (BLAKE3 + SHA256)
+pub mod amount;         // SETU raw-unit amount parsing/formatting helpers
 pub mod state_key;      // Storage key format constants and helpers
 pub mod event;
 pub mod transfer;       // Transfer and routing types
@@ -29,7 +30,7 @@ pub use setu_vlc::{VectorClock, VLCSnapshot};
 
 // Export from transfer module
 pub use transfer::{
-    Transfer, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
+    Transfer, TransferAuthorization, TransferId, ClockKey, ResourceKey, TransferType, AssignedVlc,
 };
 
 // Export from registration module
@@ -48,6 +49,13 @@ pub use event::{
 
 // State key format helpers
 pub use state_key::{object_key, parse_object_key, is_known_metadata_key};
+
+// Amount helpers
+pub use amount::{
+    AmountParseError, SETU_SYMBOL, SETU_COIN_TYPE, SETU_DECIMALS, SETU_UNIT,
+    MAX_SETU_UNITS, parse_display_amount_to_units, format_units_to_display,
+    parse_setu_amount_to_units, format_setu_units, is_setu_token_identifier,
+};
 
 // R5: Execution outcome (apply-phase verdict)
 pub use execution_outcome::ExecutionOutcome;
@@ -83,7 +91,7 @@ pub use relation::{
 
 // Subnet related
 pub use subnet::{
-    SubnetId, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
+    SubnetId, SubnetIdParseError, SubnetType, SubnetConfig, UserSubnetMembership, CrossSubnetContext,
     // Subnet interaction tracking
     InteractionType, SubnetInteraction, LocalRelation, UserSubnetActivity,
 };

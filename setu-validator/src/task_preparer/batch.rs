@@ -139,7 +139,9 @@ impl BatchTaskPreparer {
         // ════════════════════════════════════════════════════════════════
         let mut sender_subnet_set: HashSet<(String, SubnetId)> = HashSet::new();
         for transfer in transfers {
-            let subnet_id = Self::resolve_subnet_id(transfer);
+            // Invalid subnet ids are skipped here; the same transfer is
+            // recorded as a per-transfer failure during grouping below.
+            let Ok(subnet_id) = Self::resolve_subnet_id(transfer) else { continue };
             sender_subnet_set.insert((transfer.from.clone(), subnet_id));
         }
         stats.unique_sender_subnet_pairs = sender_subnet_set.len();
@@ -178,7 +180,13 @@ impl BatchTaskPreparer {
         let mut by_sender_subnet: HashMap<(String, SubnetId), Vec<(usize, &setu_types::Transfer)>> =
             HashMap::new();
         for (idx, transfer) in transfers.iter().enumerate() {
-            let subnet_id = Self::resolve_subnet_id(transfer);
+            let subnet_id = match Self::resolve_subnet_id(transfer) {
+                Ok(id) => id,
+                Err(e) => {
+                    failures.push((transfer.clone(), e));
+                    continue;
+                }
+            };
             by_sender_subnet
                 .entry((transfer.from.clone(), subnet_id))
                 .or_default()
@@ -331,7 +339,8 @@ impl BatchTaskPreparer {
         // ════════════════════════════════════════════════════════════════
         let mut sender_subnet_set: HashSet<(String, SubnetId)> = HashSet::new();
         for transfer in transfers {
-            let subnet_id = Self::resolve_subnet_id(transfer);
+            // Invalid subnet ids are skipped here; recorded as failures below.
+            let Ok(subnet_id) = Self::resolve_subnet_id(transfer) else { continue };
             sender_subnet_set.insert((transfer.from.clone(), subnet_id));
         }
         stats.unique_sender_subnet_pairs = sender_subnet_set.len();
@@ -368,7 +377,13 @@ impl BatchTaskPreparer {
         let mut by_sender_subnet: HashMap<(String, SubnetId), Vec<(usize, &setu_types::Transfer)>> =
             HashMap::new();
         for (idx, transfer) in transfers.iter().enumerate() {
-            let subnet_id = Self::resolve_subnet_id(transfer);
+            let subnet_id = match Self::resolve_subnet_id(transfer) {
+                Ok(id) => id,
+                Err(e) => {
+                    failures.push((transfer.clone(), e));
+                    continue;
+                }
+            };
             by_sender_subnet
                 .entry((transfer.from.clone(), subnet_id))
                 .or_default()
@@ -522,13 +537,16 @@ impl BatchTaskPreparer {
         }
     }
 
-    /// Resolve subnet_id from transfer (defaults to ROOT)
-    fn resolve_subnet_id(transfer: &setu_types::Transfer) -> SubnetId {
-        transfer
-            .subnet_id
-            .as_ref()
-            .and_then(|s| SubnetId::from_hex(s).ok())
-            .unwrap_or(SubnetId::ROOT)
+    /// Resolve subnet_id with the shared fallible resolver (design D1):
+    /// `None` is ROOT, anything else must resolve; invalid input fails the
+    /// transfer instead of silently becoming ROOT.
+    fn resolve_subnet_id(transfer: &setu_types::Transfer) -> Result<SubnetId, TaskPrepareError> {
+        transfer.resolve_subnet_id().map_err(|e| {
+            TaskPrepareError::InvalidInput(format!(
+                "invalid subnet_id {:?}: {}",
+                transfer.subnet_id, e
+            ))
+        })
     }
 
     /// Select best coin for a transfer (smallest sufficient)
@@ -615,7 +633,7 @@ impl BatchTaskPreparer {
         let parent_ids = self.derive_dependencies_from_snapshot(&coin.object_id, snapshot);
 
         // Create Event
-        let event = self.create_event_from_transfer(transfer, parent_ids)?;
+        let event = self.create_event_from_transfer(transfer, parent_ids, subnet_id)?;
 
         // Generate task_id using CACHED state_root
         let task_id = SolverTask::generate_task_id(&event, &pre_state_root);
@@ -634,10 +652,28 @@ impl BatchTaskPreparer {
         coin_object_id: &ObjectId,
         snapshot: &BatchStateSnapshot,
     ) -> Vec<String> {
-        snapshot
-            .get_last_modifying_event(coin_object_id)
-            .map(|event_id| vec![event_id.clone()])
-            .unwrap_or_default()
+        use super::COLD_PARENT_DROP_THRESHOLD;
+
+        // Mirror single.rs::derive_dependencies (see
+        // docs/feat/fix-transfer-parent-too-old-general/design.md):
+        // (1) drop the genesis edge unconditionally; (2) drop a cold non-genesis
+        // edge aged `floor − depth ≥ 150`. Floor is proxied by the snapshot's
+        // finalized_depth captured under the same lock.
+        let genesis_id = Event::genesis_event_id();
+        let floor = snapshot.finalized_depth();
+
+        let Some((event_id, depth)) = snapshot.get_last_modifying_event_depth(coin_object_id)
+        else {
+            return Vec::new();
+        };
+
+        if *event_id == genesis_id {
+            return Vec::new();
+        }
+        if floor.saturating_sub(depth) >= COLD_PARENT_DROP_THRESHOLD {
+            return Vec::new();
+        }
+        vec![event_id.clone()]
     }
 
     /// Create Event from Transfer with pre-derived parent_ids
@@ -645,6 +681,7 @@ impl BatchTaskPreparer {
         &self,
         transfer: &setu_types::Transfer,
         parent_ids: Vec<String>,
+        subnet_id: &SubnetId,
     ) -> Result<Event, TaskPrepareError> {
         let vlc_snapshot = match &transfer.assigned_vlc {
             Some(vlc) => {
@@ -678,6 +715,10 @@ impl BatchTaskPreparer {
 
         event = event.with_transfer(transfer.clone());
 
+        // Mandatory (design D8, R4-ISSUE-4): same rule as the single-transfer
+        // prep path — an unset event subnet defaults to ROOT at apply time.
+        event = event.with_subnet(*subnet_id);
+
         Ok(event)
     }
 }
@@ -687,6 +728,41 @@ mod tests {
     use super::*;
     use setu_types::{Transfer, TransferType};
     use setu_types::task::OperationType;
+
+    // Test #18 (design §9): batch resolver accepts a public-id subnet and the
+    // prepared task stays non-ROOT with event.subnet_id set.
+    #[test]
+    fn test_batch_resolver_accepts_public_id_subnet() {
+        use setu_storage::{GlobalStateManager, SharedStateManager, MerkleStateProvider, init_coins_split};
+        let shared = std::sync::Arc::new(SharedStateManager::new(GlobalStateManager::new()));
+        {
+            let mut manager = shared.lock_write();
+            init_coins_split(&mut manager, "alice", 1_000, 1, "gaming-subnet");
+            shared.publish_snapshot(&manager);
+        }
+        let provider = std::sync::Arc::new(MerkleStateProvider::new(shared));
+        let preparer = BatchTaskPreparer::new("validator-1".to_string(), provider);
+
+        let canonical = setu_types::SubnetId::from_str_id("gaming-subnet");
+        let transfer = Transfer::new("batch-subnet-tx", "alice", "bob", 100)
+            .with_type(TransferType::SetuTransfer)
+            .with_power(10)
+            .with_subnet("gaming-subnet"); // public id, not hex
+
+        let result = preparer.prepare_transfers_batch(&[transfer]);
+        assert_eq!(result.stats.successful, 1, "failures: {:?}", result.failures);
+
+        let task = &result.tasks[0];
+        assert_eq!(task.subnet_id, canonical, "task must stay non-ROOT");
+        assert_eq!(task.event.subnet_id, Some(canonical), "event subnet must be set");
+
+        // Invalid subnet grammar becomes a per-transfer failure, never ROOT
+        let bad = Transfer::new("batch-bad-tx", "alice", "bob", 100)
+            .with_subnet("Bad_Subnet!");
+        let result = preparer.prepare_transfers_batch(&[bad]);
+        assert_eq!(result.stats.successful, 0);
+        assert_eq!(result.failures.len(), 1);
+    }
 
     #[test]
     fn test_batch_prepare_single_transfer() {
@@ -832,5 +908,92 @@ mod tests {
         // alice and bob are 2 unique senders (all in ROOT subnet)
         assert_eq!(result.stats.unique_sender_subnet_pairs, 2);
         assert_eq!(result.stats.coins_selected, 3);
+    }
+
+    // ---- Cold-parent drop (Approach C) ----------------------------------
+    //
+    // docs/feat/fix-transfer-parent-too-old-general/design.md §5: a parent
+    // edge is dropped at preparation time when it is the genesis event OR a
+    // non-genesis event aged `floor − depth ≥ COLD_PARENT_DROP_THRESHOLD`.
+
+    fn oid(tag: u8) -> ObjectId {
+        ObjectId::new([tag; 32])
+    }
+
+    #[test]
+    fn test_snapshot_keeps_recent_non_genesis_parent() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(1);
+        // floor 1000, parent at depth 900 → age 100 < 150 → keep.
+        let snapshot = BatchStateSnapshot::new_for_testing(
+            1000,
+            vec![(object, "event-recent".to_string(), 900)],
+        );
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert_eq!(parents, vec!["event-recent".to_string()]);
+    }
+
+    #[test]
+    fn test_snapshot_drops_aged_non_genesis_parent() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(2);
+        // floor 1000, parent at depth 800 → age 200 ≥ 150 → drop.
+        let snapshot = BatchStateSnapshot::new_for_testing(
+            1000,
+            vec![(object, "event-aged".to_string(), 800)],
+        );
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert!(parents.is_empty(), "aged parent must be dropped");
+    }
+
+    #[test]
+    fn test_snapshot_drop_boundary() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(3);
+        let threshold = super::super::COLD_PARENT_DROP_THRESHOLD;
+
+        // age == threshold-1 → keep.
+        let keep = BatchStateSnapshot::new_for_testing(
+            threshold + 99,
+            vec![(object, "boundary-keep".to_string(), 100)],
+        );
+        assert_eq!(
+            preparer.derive_dependencies_from_snapshot(&object, &keep),
+            vec!["boundary-keep".to_string()]
+        );
+
+        // age == threshold → drop.
+        let drop = BatchStateSnapshot::new_for_testing(
+            threshold + 100,
+            vec![(object, "boundary-drop".to_string(), 100)],
+        );
+        assert!(
+            preparer
+                .derive_dependencies_from_snapshot(&object, &drop)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_drops_genesis_parent_unconditionally() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let object = oid(4);
+        let genesis = Event::genesis_event_id();
+        // Even with floor == depth (age 0) genesis is dropped.
+        let snapshot =
+            BatchStateSnapshot::new_for_testing(0, vec![(object, genesis, 0)]);
+
+        let parents = preparer.derive_dependencies_from_snapshot(&object, &snapshot);
+        assert!(parents.is_empty(), "genesis parent must always be dropped");
+    }
+
+    #[test]
+    fn test_snapshot_no_modifier_returns_empty() {
+        let preparer = BatchTaskPreparer::new_for_testing("validator-1".to_string());
+        let snapshot = BatchStateSnapshot::new_for_testing(1000, vec![]);
+        let parents = preparer.derive_dependencies_from_snapshot(&oid(5), &snapshot);
+        assert!(parents.is_empty());
     }
 }
