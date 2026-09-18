@@ -85,6 +85,11 @@ impl InMemoryStateStore {
             raw_objects: HashMap::new(),
         }
     }
+
+    /// Access the raw object storage for state root computation.
+    pub fn raw_objects(&self) -> &HashMap<ObjectId, Vec<u8>> {
+        &self.raw_objects
+    }
     
     /// Update ownership index (O(1) amortized via reverse index)
     fn update_ownership_index(&mut self, object_id: ObjectId, new_owner: &Address) {
