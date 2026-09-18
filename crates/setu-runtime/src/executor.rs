@@ -1168,7 +1168,34 @@ impl<S: StateStore> RuntimeExecutor<S> {
         
         let is_exact_split = source.data.balance.value() == total_split;
         
-        // 2. Create new coins
+        // 2. Handle source coin FIRST (consume before creating new coins)
+        // This ensures atomicity: if the process crashes after this step,
+        // the source coin is already consumed and there's no inflation.
+        // Step 3 (creating new coins) becomes a recovery operation.
+        if is_exact_split {
+            // Exact split: delete source coin (prevent 0-balance zombie)
+            self.state.delete_object(&source_coin_id)?;
+            deleted_objects.push(source_coin_id);
+            state_changes.insert(0, StateChange {
+                change_type: StateChangeType::Delete,
+                object_id: source_coin_id,
+                old_state: Some(source_old_state),
+                new_state: None,
+            });
+        } else {
+            // Partial split: update source coin
+            source.increment_version();
+            let source_new_state = source.to_coin_state_bytes();
+            self.state.set_object(source_coin_id, source)?;
+            state_changes.insert(0, StateChange {
+                change_type: StateChangeType::Update,
+                object_id: source_coin_id,
+                old_state: Some(source_old_state),
+                new_state: Some(source_new_state),
+            });
+        }
+        
+        // 3. Create new coins
         for &amount in amounts {
             let new_coin_id = ctx.new_coin_id();
             let new_coin = create_coin_with_id(
@@ -1192,30 +1219,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
             
             let _ = source.data.balance.withdraw(amount)
                 .map_err(|e| RuntimeError::InvalidTransaction(e))?;
-        }
-        
-        // 3. Handle source coin
-        if is_exact_split {
-            // Exact split: delete source coin (prevent 0-balance zombie)
-            self.state.delete_object(&source_coin_id)?;
-            deleted_objects.push(source_coin_id);
-            state_changes.insert(0, StateChange {
-                change_type: StateChangeType::Delete,
-                object_id: source_coin_id,
-                old_state: Some(source_old_state),
-                new_state: None,
-            });
-        } else {
-            // Partial split: update source coin
-            source.increment_version();
-            let source_new_state = source.to_coin_state_bytes();
-            self.state.set_object(source_coin_id, source)?;
-            state_changes.insert(0, StateChange {
-                change_type: StateChangeType::Update,
-                object_id: source_coin_id,
-                old_state: Some(source_old_state),
-                new_state: Some(source_new_state),
-            });
         }
         
         Ok(ExecutionOutput {
