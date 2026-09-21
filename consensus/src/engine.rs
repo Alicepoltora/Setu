@@ -597,6 +597,7 @@ impl ConsensusEngine {
         let count = {
             let mut vs = self.validator_set.write().await;
             vs.add_validator(info.clone());
+            // add_validator may reject unauthenticated membership changes (#45)
             vs.count()
         };
         {
@@ -1917,6 +1918,8 @@ pub struct DagStats {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
     use super::*;
     use crate::broadcaster::MockBroadcaster;
     use setu_types::{Anchor, AnchorMerkleRoots, EventType, NodeInfo, ValidatorInfo};
@@ -1931,7 +1934,11 @@ mod tests {
                 "127.0.0.1".to_string(),
                 8000 + i as u16,
             );
-            set.add_validator(ValidatorInfo::new(node, false));
+            let mut node_info = node.clone();
+            let signing_key = SigningKey::generate(&mut OsRng);
+            node_info.public_key = signing_key.verifying_key().to_bytes().to_vec();
+            let signature = signing_key.sign(node.id.as_bytes()).to_bytes().to_vec();
+            set.add_validator(ValidatorInfo::new(node_info, false).with_signature(signature));
         }
         set
     }
