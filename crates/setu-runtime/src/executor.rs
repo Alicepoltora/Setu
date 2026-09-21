@@ -1183,7 +1183,11 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 new_state: None,
             });
         } else {
-            // Partial split: update source coin
+            // Partial split: withdraw from source before updating
+            for &amount in amounts {
+                source.data.balance.withdraw(amount)
+                    .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+            }
             source.increment_version();
             let source_new_state = source.to_coin_state_bytes();
             self.state.set_object(source_coin_id, source)?;
@@ -1216,9 +1220,6 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 old_state: None,
                 new_state: Some(new_coin_state),
             });
-            
-            let _ = source.data.balance.withdraw(amount)
-                .map_err(|e| RuntimeError::InvalidTransaction(e))?;
         }
         
         Ok(ExecutionOutput {

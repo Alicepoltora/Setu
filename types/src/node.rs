@@ -123,14 +123,16 @@ impl ValidatorInfo {
             // security (audit #45).
             return Ok(());
         }
-        if self.node.public_key.is_empty() {
-            return Err("missing public key for signature verification");
+        if self.node.public_key.len() != 32 {
+            return Err("invalid public key length");
         }
         // Verify signature against node.id using the validator's public key
-        use ed25519_dalek::{Verifier, Signature};
-        let sig = Signature::from_bytes(&self.signature)
+        use ed25519_dalek::{VerifyingKey, Verifier, Signature};
+        let sig = Signature::try_from(self.signature.as_slice())
             .map_err(|_| "invalid signature format")?;
-        let pk = ed25519_dalek::PublicKey::from_bytes(&self.node.public_key)
+        let pk_bytes: &[u8; 32] = self.node.public_key.as_slice()
+            .try_into().map_err(|_| "invalid public key length")?;
+        let pk = VerifyingKey::from_bytes(pk_bytes)
             .map_err(|_| "invalid public key format")?;
         pk.verify(self.node.id.as_bytes(), &sig)
             .map_err(|_| "invalid validator signature")
