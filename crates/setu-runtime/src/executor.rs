@@ -1172,6 +1172,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         // This ensures atomicity: if the process crashes after this step,
         // the source coin is already consumed and there's no inflation.
         // Step 3 (creating new coins) becomes a recovery operation.
+        let coin_type = source.data.coin_type.clone();
         if is_exact_split {
             // Exact split: delete source coin (prevent 0-balance zombie)
             self.state.delete_object(&source_coin_id)?;
@@ -1206,7 +1207,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 new_coin_id,
                 owner.clone(),
                 amount,
-                source.data.coin_type.as_str(),
+                coin_type.as_str(),
                 ctx.timestamp,
             );
             let new_coin_state = new_coin.to_coin_state_bytes();
