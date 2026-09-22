@@ -7,6 +7,7 @@
 //! It integrates with the liveness module for leader election.
 
 use setu_types::ValidatorInfo;
+use tracing::warn;
 #[cfg(test)]
 use setu_types::NodeInfo;
 use std::collections::HashMap;
@@ -86,7 +87,7 @@ impl ValidatorSet {
     /// The validator's signature over its node ID must be verified
     /// before adding to prevent unauthorized membership changes.
     /// If verification fails, the validator is NOT added and a warning is logged.
-    pub fn add_validator(&mut self, info: ValidatorInfo) {
+    pub fn add_validator(&mut self, mut info: ValidatorInfo) {
         // Verify the validator's signature (audit #45 / unauthenticated membership)
         if let Err(e) = info.verify() {
             warn!(

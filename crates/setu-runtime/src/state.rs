@@ -206,6 +206,11 @@ impl InMemoryObjectStore {
         }
     }
 
+    /// Access the raw key-value storage for state root computation.
+    pub fn raw(&self) -> &HashMap<String, Vec<u8>> {
+        &self.raw
+    }
+
     fn remove_from_ownership_index(&mut self, id: &ObjectId) {
         if let Some(old_owner) = self.object_owner.remove(id) {
             if let Some(ids) = self.ownership_index.get_mut(&old_owner) {

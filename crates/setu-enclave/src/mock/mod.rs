@@ -678,7 +678,7 @@ impl MockEnclave {
         // Increment execution counter
         *self.execution_count.write().await += 1;
 
-        Ok((diff, processed, failed, local_runtime))
+        Ok((diff, processed, failed))
     }
 
     /// Execute events with an isolated local runtime (solver-tee3 mode)
@@ -796,7 +796,7 @@ impl MockEnclave {
         // Increment execution counter
         *self.execution_count.write().await += 1;
 
-        Ok((diff, processed, failed))
+        Ok((diff, processed, failed, local_runtime))
     }
 
     /// Execute a single event using the provided runtime
@@ -1765,7 +1765,7 @@ impl EnclaveRuntime for MockEnclave {
             .any(|e| matches!(e.payload, setu_types::event::EventPayload::MovePtb(_)));
         let use_read_set_state = use_read_set_state || has_move_ptb;
 
-        let (diff, events_processed, events_failed, runtime) = if use_read_set_state {
+        let (diff, events_processed, events_failed, post_state_root) = if use_read_set_state {
             // Build temporary state from read_set into a LOCAL ObjectStore
             let local_store =
                 self.build_object_store_from_read_set(&input.read_set, &input.module_read_set)?;
@@ -1778,40 +1778,29 @@ impl EnclaveRuntime for MockEnclave {
             );
 
             // Execute using the ISOLATED local runtime (not self.runtime!)
-            // Returns the runtime so we can compute the post-state root
-            self.simulate_execution_isolated(&input, local_runtime)
-                .await?
+            let (diff, events_processed, events_failed, runtime) =
+                self.simulate_execution_isolated(&input, local_runtime)
+                    .await?;
+            let raw_data: std::collections::HashMap<String, Vec<u8>> =
+                runtime.state().raw().clone();
+            let post_state_root = Self::compute_state_root(&raw_data);
+            (diff, events_processed, events_failed, post_state_root)
         } else {
             // Legacy mode: use shared self.runtime (only for backward compatibility)
             self.simulate_execution(&input, None).await?;
             // self.runtime contains the post-execution state
             let guard = self.runtime.read().await;
-            let cloned = guard.state().clone();
+            let state = guard.state().clone();
             drop(guard);
-            (StateDiff::new(), Vec::new(), Vec::new(), cloned)
-        };
-
-        // Compute post-state root from the ACTUAL post-execution state.
-        // Previously this used self.legacy_state, which did not reflect
-        // the results of execution — causing attestation bindings to
-        // reference stale state roots.
-        // Compute post-state root from the ACTUAL post-execution state.
-        // Previously this used self.legacy_state, which did not reflect
-        // the results of execution — causing attestation bindings to
-        // reference stale state roots.
-        let post_state_root = {
-            let raw_data: std::collections::HashMap<String, Vec<u8>> = if use_read_set_state {
-                // Isolated path: InMemoryObjectStore::raw() gives HashMap<String, Vec<u8>>
-                runtime.state().raw().clone()
-            } else {
-                // Legacy path: InMemoryStateStore::raw_objects() gives HashMap<ObjectId, Vec<u8>>
-                // Convert ObjectId keys to string for compute_state_root
-                let store = runtime.state();
-                store.raw_objects().iter()
-                    .map(|(id, bytes)| (format!("{:?}", id), bytes.clone()))
-                    .collect()
-            };
-            Self::compute_state_root(&raw_data)
+            let runtime = RuntimeExecutor::new(state);
+            let raw_data: std::collections::HashMap<String, Vec<u8>> = runtime
+                .state()
+                .raw_objects()
+                .iter()
+                .map(|(id, bytes)| (format!("{:?}", id), bytes.clone()))
+                .collect();
+            let post_state_root = Self::compute_state_root(&raw_data);
+            (StateDiff::new(), Vec::new(), Vec::new(), post_state_root)
         };
 
         // Compute input hash for attestation binding
