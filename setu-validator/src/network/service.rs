@@ -2467,6 +2467,7 @@ mod tests {
             proposal_id,
             action: setu_types::governance::GovernanceAction::RegisterSystemSubnet(registration),
         });
+        event.recompute_id(); // Seal content-bound ID (verify_id gate)
         event.set_execution_result(setu_types::ExecutionResult::success());
         event
     }

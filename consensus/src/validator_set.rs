@@ -339,7 +339,7 @@ impl Default for ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{SigningKey, Signature};
+    use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
 
     fn create_validator(id: &str) -> ValidatorInfo {

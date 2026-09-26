@@ -126,6 +126,21 @@ impl VectorClock {
     pub fn nodes(&self) -> Vec<&String> {
         self.clocks.keys().collect()
     }
+
+    /// Sorted (node_id, time) entries for deterministic hashing.
+    ///
+    /// HashMap iteration order is nondeterministic across runs, so any
+    /// digest over a vector clock MUST use this (or equivalent sorting)
+    /// instead of iterating `clocks` directly.
+    pub fn sorted_entries(&self) -> Vec<(&str, u64)> {
+        let mut entries: Vec<(&str, u64)> = self
+            .clocks
+            .iter()
+            .map(|(k, &t)| (k.as_str(), t))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
+    }
     
     /// Get the size of the clock (number of nodes)
     pub fn len(&self) -> usize {

@@ -815,6 +815,7 @@ dependencies = [
  "hex",
  "lru",
  "parking_lot 0.12.5",
+ "rand_core 0.6.4",
  "serde_json",
  "setu-merkle",
  "setu-storage",

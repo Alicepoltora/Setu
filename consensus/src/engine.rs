@@ -1918,7 +1918,7 @@ pub struct DagStats {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
     use super::*;
     use crate::broadcaster::MockBroadcaster;
